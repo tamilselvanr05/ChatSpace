@@ -1,0 +1,15 @@
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Firebase service account
+server/firebase-service-account.json
+
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Build output
+client/dist/
