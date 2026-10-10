@@ -15,7 +15,38 @@ const userSchema = new mongoose.Schema({
 
     password: {
         type: String,
-        required: true
+        required: false
+    },
+
+    firebaseUid: {
+        type: String,
+        unique: true,
+        sparse: true
+    },
+
+    blockedUsers: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+    }],
+
+    hiddenConversations: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+    }],
+
+    isDeleting: {
+        type: Boolean,
+        default: false
+    },
+
+    isDeleted: {
+        type: Boolean,
+        default: false
+    },
+
+    deletedAt: {
+        type: Date,
+        default: null
     },
 
     isOnline: {

@@ -8,6 +8,11 @@ const messageSchema = new mongoose.Schema(
             required: true
         },
 
+        senderName: {
+            type: String,
+            default: ""
+        },
+
         receiverId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "User",

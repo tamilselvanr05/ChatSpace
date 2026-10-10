@@ -3,11 +3,12 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 require("dotenv").config();
 const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
 const User = require("./models/user");
 const Message = require("./models/message");
 const Group = require("./models/group");
 const authMiddleware = require("./middleware/authMiddleware");
+const { resolveFirebaseUser } = require("./firebaseIdentity");
+const firebaseAdminAuth = require("./firebaseAdmin");
 
 // Socket.IO imports
 const http = require("http");
@@ -92,6 +93,64 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+io.use(async (socket, next) => {
+    const token = socket.handshake.auth?.token;
+
+    if (typeof token !== "string" || !token) {
+        const error = new Error("Authentication required");
+        error.data = { code: "AUTH_REQUIRED" };
+        return next(error);
+    }
+
+    try {
+        const user = await resolveFirebaseUser(token);
+        if (user.isDeleting || user.isDeleted) {
+            const error = new Error("Account deletion is pending");
+            error.data = { code: "ACCOUNT_DELETION_PENDING" };
+            return next(error);
+        }
+        socket.userId = user._id.toString();
+        socket.data.userId = socket.userId;
+        socket.data.firebaseUid = user.firebaseUid;
+        next();
+    } catch {
+        const error = new Error("Authentication failed");
+        error.data = { code: "AUTH_INVALID" };
+        return next(error);
+    }
+});
+
+const activeCallsByUser = new Map();
+
+async function areUsersBlocked(firstUserId, secondUserId) {
+    const users = await User.find({
+        _id: { $in: [firstUserId, secondUserId] }
+    }).select("_id blockedUsers isDeleting isDeleted");
+    if (users.length !== 2 || users.some((user) => user.isDeleting || user.isDeleted)) {
+        return true;
+    }
+
+    return users.some((user) => user.blockedUsers.some((blockedId) =>
+        blockedId.toString() === (user._id.toString() === firstUserId
+            ? secondUserId
+            : firstUserId)
+    ));
+}
+
+function terminateActiveCall(firstUserId, secondUserId) {
+    if (
+        activeCallsByUser.get(firstUserId) !== secondUserId &&
+        activeCallsByUser.get(secondUserId) !== firstUserId
+    ) {
+        return;
+    }
+
+    activeCallsByUser.delete(firstUserId);
+    activeCallsByUser.delete(secondUserId);
+    io.to(firstUserId).emit("call:end", { from: secondUserId, to: firstUserId });
+    io.to(secondUserId).emit("call:end", { from: firstUserId, to: secondUserId });
+}
 
 app.post("/groups", authMiddleware, async (req, res) => {
 
@@ -267,7 +326,9 @@ app.put("/groups/:groupId/members", authMiddleware, async (req, res) => {
         ];
 
         const users = await User.find({
-            _id: { $in: uniqueRequestedMembers }
+            _id: { $in: uniqueRequestedMembers },
+            isDeleted: { $ne: true },
+            isDeleting: { $ne: true }
         }).select("_id username email");
 
         if (users.length !== uniqueRequestedMembers.length) {
@@ -413,56 +474,59 @@ io.on("connection", (socket) => {
 
     console.log("User connected:", socket.id);
 
-    socket.on("join", async (userId) => {
+    const authenticatedUserId = socket.userId;
+    socket.join(authenticatedUserId);
 
-        try {
-
-            socket.userId = userId;
-
-            socket.join(userId);
-
-            await User.findByIdAndUpdate(
-                userId,
-                { isOnline: true }
-            );
-
+    User.findByIdAndUpdate(
+        authenticatedUserId,
+        { isOnline: true }
+    ).then(async () => {
+        if (socket.connected) {
             io.emit("userStatusChanged", {
-                userId: userId,
+                userId: authenticatedUserId,
                 isOnline: true
             });
-
-            console.log(`User ${userId} joined room`);
-            console.log(`User ${userId} is online`);
-
-        } catch (error) {
-
-            console.log("Join error:", error);
-
+            return;
         }
 
+        const remainingSockets = await io.in(authenticatedUserId).fetchSockets();
+        if (remainingSockets.length === 0) {
+            await User.findByIdAndUpdate(
+                authenticatedUserId,
+                { isOnline: false }
+            );
+        }
+    }).catch((error) => {
+        console.log("Connection status error:", error);
     });
 
-    socket.on("typing", (data) => {
+    socket.on("typing", async (data = {}) => {
+        try {
+            const receiverId = data.receiverId?.toString();
 
-        const {
-            senderId,
-            receiverId,
-            isTyping
-        } = data;
+            if (
+                !mongoose.Types.ObjectId.isValid(receiverId) ||
+                receiverId === authenticatedUserId ||
+                !(await User.exists({ _id: receiverId, isDeleted: { $ne: true } })) ||
+                (await areUsersBlocked(authenticatedUserId, receiverId))
+            ) {
+                return;
+            }
 
-        io.to(receiverId).emit("userTyping", {
-            senderId,
-            isTyping
-        });
-
+            io.to(receiverId).emit("userTyping", {
+                senderId: authenticatedUserId,
+                isTyping: Boolean(data.isTyping)
+            });
+        } catch (error) {
+            console.log("Typing event error:", error);
+        }
     });
 
-    socket.on("sendMessage", async (data) => {
+    socket.on("sendMessage", async (data = {}) => {
 
         try {
 
             const {
-                senderId,
                 receiverId,
                 message,
                 messageType,
@@ -473,11 +537,40 @@ io.on("connection", (socket) => {
                 replyTo
             } = data;
 
-            console.log("Message received:", data);
+            const normalizedReceiverId = receiverId?.toString();
+
+            if (
+                !mongoose.Types.ObjectId.isValid(normalizedReceiverId) ||
+                normalizedReceiverId === authenticatedUserId ||
+                !(await User.exists({ _id: normalizedReceiverId, isDeleted: { $ne: true } })) ||
+                (await areUsersBlocked(authenticatedUserId, normalizedReceiverId))
+            ) {
+                return;
+            }
+
+            if (replyTo) {
+                const replyToId = replyTo.messageId;
+
+                if (!mongoose.Types.ObjectId.isValid(replyToId)) {
+                    return;
+                }
+
+                const repliedMessage = await Message.findOne({
+                    _id: replyToId,
+                    $or: [
+                        { senderId: authenticatedUserId, receiverId: normalizedReceiverId },
+                        { senderId: normalizedReceiverId, receiverId: authenticatedUserId }
+                    ]
+                }).select("_id");
+
+                if (!repliedMessage) {
+                    return;
+                }
+            }
 
             const newMessage = new Message({
-                senderId,
-                receiverId,
+                senderId: authenticatedUserId,
+                receiverId: normalizedReceiverId,
                 message,
                 messageType: messageType || "text",
                 fileName: fileName || null,
@@ -489,12 +582,19 @@ io.on("connection", (socket) => {
 
             await newMessage.save();
 
-            io.to(receiverId).emit(
+            await Promise.all([
+                User.updateOne({ _id: authenticatedUserId }, { $pull: { hiddenConversations: normalizedReceiverId } }),
+                User.updateOne({ _id: normalizedReceiverId }, { $pull: { hiddenConversations: authenticatedUserId } })
+            ]);
+            io.to(authenticatedUserId).emit("conversationRestored", { userId: normalizedReceiverId });
+            io.to(normalizedReceiverId).emit("conversationRestored", { userId: authenticatedUserId });
+
+            io.to(normalizedReceiverId).emit(
                 "receiveMessage",
                 newMessage
             );
 
-            io.to(senderId).emit(
+            io.to(authenticatedUserId).emit(
                 "receiveMessage",
                 newMessage
             );
@@ -509,12 +609,11 @@ io.on("connection", (socket) => {
 
     });
 
-    socket.on("sendGroupMessage", async (data) => {
+    socket.on("sendGroupMessage", async (data = {}) => {
 
         try {
 
             const {
-                senderId,
                 groupId,
                 message,
                 messageType,
@@ -525,37 +624,41 @@ io.on("connection", (socket) => {
                 replyTo
             } = data;
 
-            console.log(
-                "Group message received:",
-                data
-            );
+            if (!mongoose.Types.ObjectId.isValid(groupId)) {
+                return;
+            }
 
-            const group = await Group.findById(groupId);
+            const group = await Group.findOne({
+                _id: groupId,
+                members: authenticatedUserId
+            });
 
-            if (!group) {
+            if (!group || !(await User.exists({ _id: authenticatedUserId, isDeleting: { $ne: true }, isDeleted: { $ne: true } }))) {
 
                 console.log("Group not found");
 
                 return;
             }
 
-            const isMember = group.members.some(
-                (memberId) =>
-                    memberId.toString() ===
-                    senderId.toString()
-            );
+            if (replyTo) {
+                const replyToId = replyTo.messageId;
 
-            if (!isMember) {
+                if (!mongoose.Types.ObjectId.isValid(replyToId)) {
+                    return;
+                }
 
-                console.log(
-                    "User is not a group member"
-                );
+                const repliedMessage = await Message.findOne({
+                    _id: replyToId,
+                    groupId: group._id
+                }).select("_id");
 
-                return;
+                if (!repliedMessage) {
+                    return;
+                }
             }
 
             const newMessage = new Message({
-                senderId: senderId,
+                senderId: authenticatedUserId,
                 groupId: groupId,
                 message: message,
                 messageType: messageType || "text",
@@ -592,173 +695,88 @@ io.on("connection", (socket) => {
 
     });
 
-    socket.on("deleteMessage", async (data) => {
-
+    socket.on("deleteMessage", async (data = {}) => {
         try {
+            const { messageId, deleteFor } = data;
 
-            const {
-                messageId,
-                senderId,
-                receiverId,
-                groupId,
-                deleteFor
-            } = data;
-
-            if (deleteFor === "me") {
-
-                const message = await Message.findById(messageId);
-
-                if (!message) {
-                    return;
-                }
-
-                if (message.groupId) {
-
-                    const group = await Group.findOne({
-                        _id: message.groupId,
-                        members: senderId
-                    });
-
-                    if (
-                        !group ||
-                        message.groupId.toString() !== groupId?.toString()
-                    ) {
-                        return;
-                    }
-
-                } else if (
-                    message.senderId.toString() !== senderId.toString() &&
-                    message.receiverId?.toString() !== senderId.toString()
-                ) {
-                    return;
-                }
-
-                await Message.findByIdAndUpdate(
-                    messageId,
-                    {
-                        $addToSet: {
-                            deletedFor: senderId
-                        }
-                    }
-                );
-
-                io.to(senderId).emit(
-                    "messageDeletedForMe",
-                    {
-                        messageId: messageId
-                    }
-                );
-
-                console.log(
-                    "Message deleted for me:",
-                    messageId
-                );
-
+            if (!mongoose.Types.ObjectId.isValid(messageId)) {
                 return;
             }
 
-            if (deleteFor === "everyone") {
+            const message = await Message.findById(messageId);
 
-                if (groupId) {
-
-                    const group = await Group.findOne({
-                        _id: groupId,
-                        members: senderId
-                    });
-
-                    if (!group) {
-                        return;
-                    }
-
-                    const deletedMessage =
-                        await Message.findOneAndDelete({
-                            _id: messageId,
-                            senderId: senderId,
-                            groupId: groupId
-                        });
-
-                    if (!deletedMessage) {
-                        console.log(
-                            "Group message not found or delete not allowed"
-                        );
-                        return;
-                    }
-
-                    group.members.forEach((memberId) => {
-                        io.to(memberId.toString()).emit(
-                            "messageDeleted",
-                            {
-                                messageId: messageId
-                            }
-                        );
-                    });
-
-                    console.log(
-                        "Group message deleted for everyone:",
-                        messageId
-                    );
-
-                    return;
-                }
-
-                const deletedMessage =
-                    await Message.findOneAndDelete({
-                        _id: messageId,
-                        senderId: senderId,
-                        receiverId: receiverId
-                    });
-
-                if (!deletedMessage) {
-
-                    console.log(
-                        "Message not found or delete not allowed"
-                    );
-
-                    return;
-                }
-
-                io.to(senderId).emit(
-                    "messageDeleted",
-                    {
-                        messageId: messageId
-                    }
-                );
-
-                io.to(receiverId).emit(
-                    "messageDeleted",
-                    {
-                        messageId: messageId
-                    }
-                );
-
-                console.log(
-                    "Message deleted for everyone:",
-                    messageId
-                );
+            if (!message) {
+                return;
             }
 
+            let group = null;
+
+            if (message.groupId) {
+                group = await Group.findOne({
+                    _id: message.groupId,
+                    members: authenticatedUserId
+                });
+
+                if (!group) {
+                    return;
+                }
+            } else if (
+                message.senderId.toString() !== authenticatedUserId &&
+                message.receiverId?.toString() !== authenticatedUserId
+            ) {
+                return;
+            }
+
+            if (deleteFor === "me") {
+                await Message.updateOne(
+                    { _id: message._id },
+                    { $addToSet: { deletedFor: authenticatedUserId } }
+                );
+                io.to(authenticatedUserId).emit("messageDeletedForMe", {
+                    messageId: message._id.toString()
+                });
+                return;
+            }
+
+            if (
+                deleteFor !== "everyone" ||
+                message.senderId.toString() !== authenticatedUserId
+            ) {
+                return;
+            }
+
+            const deletedMessage = await Message.findOneAndDelete({
+                _id: message._id,
+                senderId: authenticatedUserId
+            });
+
+            if (!deletedMessage) {
+                return;
+            }
+
+            const recipients = group
+                ? group.members.map((memberId) => memberId.toString())
+                : [authenticatedUserId, message.receiverId.toString()];
+
+            recipients.forEach((recipientId) => {
+                io.to(recipientId).emit("messageDeleted", {
+                    messageId: message._id.toString()
+                });
+            });
         } catch (error) {
-
-            console.log(
-                "Delete message error:",
-                error
-            );
-
+            console.log("Delete message error:", error);
         }
-
     });
 
     socket.on("starMessage", async (data) => {
 
         try {
 
-            const { messageId, userId } = data;
+            const { messageId } = data;
+            const userId = authenticatedUserId;
 
             if (
-                !mongoose.Types.ObjectId.isValid(messageId) ||
-                !mongoose.Types.ObjectId.isValid(userId) ||
-                (socket.userId &&
-                    socket.userId.toString() !== userId.toString())
+                !mongoose.Types.ObjectId.isValid(messageId)
             ) {
                 return;
             }
@@ -847,13 +865,11 @@ io.on("connection", (socket) => {
 
         try {
 
-            const { messageId, userId } = data;
+            const { messageId } = data;
+            const userId = authenticatedUserId;
 
             if (
-                !mongoose.Types.ObjectId.isValid(messageId) ||
-                !mongoose.Types.ObjectId.isValid(userId) ||
-                (socket.userId &&
-                    socket.userId.toString() !== userId.toString())
+                !mongoose.Types.ObjectId.isValid(messageId)
             ) {
                 return;
             }
@@ -863,7 +879,7 @@ io.on("connection", (socket) => {
                 receiverId: userId
             });
 
-            if (!message) {
+            if (!message || await areUsersBlocked(userId, message.senderId.toString())) {
                 return;
             }
 
@@ -904,13 +920,11 @@ io.on("connection", (socket) => {
 
         try {
 
-            const { messageId, userId } = data;
+            const { messageId } = data;
+            const userId = authenticatedUserId;
 
             if (
-                !mongoose.Types.ObjectId.isValid(messageId) ||
-                !mongoose.Types.ObjectId.isValid(userId) ||
-                (socket.userId &&
-                    socket.userId.toString() !== userId.toString())
+                !mongoose.Types.ObjectId.isValid(messageId)
             ) {
                 return;
             }
@@ -933,6 +947,8 @@ io.on("connection", (socket) => {
             } else if (
                 message.receiverId?.toString() !== userId.toString()
             ) {
+                return;
+            } else if (await areUsersBlocked(userId, message.senderId.toString())) {
                 return;
             }
 
@@ -981,21 +997,58 @@ io.on("connection", (socket) => {
 
     });
 
-    const relayCallEvent = (eventName, data = {}) => {
-        const { from, to } = data;
+    const relayCallEvent = async (eventName, data = {}) => {
+        const from = authenticatedUserId;
+        const to = data.to?.toString();
 
         if (
-            !socket.userId ||
-            socket.userId.toString() !== from?.toString() ||
-            !mongoose.Types.ObjectId.isValid(to)
+            !mongoose.Types.ObjectId.isValid(to) ||
+            from === to
         ) {
             return;
         }
 
-        io.to(to.toString()).emit(eventName, {
+        if (eventName === "call:offer") {
+            if (
+                !(await User.exists({ _id: to, isDeleted: { $ne: true } })) ||
+                await areUsersBlocked(from, to)
+            ) {
+                io.to(from).emit("call:end", { from: to, to: from });
+                return;
+            }
+
+            const recipientSockets = await io.in(to).fetchSockets();
+
+            if (recipientSockets.length === 0) {
+                io.to(from).emit("call:end", { from: to, to: from });
+                return;
+            }
+
+            if (activeCallsByUser.has(from) || activeCallsByUser.has(to)) {
+                io.to(from).emit("call:busy", { from: to, to: from });
+                return;
+            }
+
+            activeCallsByUser.set(from, to);
+            activeCallsByUser.set(to, from);
+        } else if (activeCallsByUser.get(from) !== to) {
+            return;
+        }
+
+        io.to(to).emit(eventName, {
             ...data,
-            from: socket.userId.toString()
+            from,
+            to
         });
+
+        if (["call:reject", "call:busy", "call:end"].includes(eventName)) {
+            if (activeCallsByUser.get(from) === to) {
+                activeCallsByUser.delete(from);
+            }
+            if (activeCallsByUser.get(to) === from) {
+                activeCallsByUser.delete(to);
+            }
+        }
     };
 
     [
@@ -1007,7 +1060,9 @@ io.on("connection", (socket) => {
         "call:end"
     ].forEach((eventName) => {
         socket.on(eventName, (data) => {
-            relayCallEvent(eventName, data);
+            relayCallEvent(eventName, data).catch((error) => {
+                console.log("Call signaling error:", error);
+            });
         });
     });
      
@@ -1018,22 +1073,31 @@ io.on("connection", (socket) => {
 
         try {
 
-            if (socket.userId) {
+            const remainingSockets = await io.in(authenticatedUserId).fetchSockets();
 
+            if (remainingSockets.length === 0) {
                 await User.findByIdAndUpdate(
-                    socket.userId,
+                    authenticatedUserId,
                     { isOnline: false }
                 );
 
                 io.emit("userStatusChanged", {
-                    userId: socket.userId,
+                    userId: authenticatedUserId,
                     isOnline: false
                 });
 
-                console.log(
-                    `User ${socket.userId} is offline`
-                );
+                const peerId = activeCallsByUser.get(authenticatedUserId);
 
+                if (peerId) {
+                    activeCallsByUser.delete(authenticatedUserId);
+                    if (activeCallsByUser.get(peerId) === authenticatedUserId) {
+                        activeCallsByUser.delete(peerId);
+                    }
+                    io.to(peerId).emit("call:end", {
+                        from: authenticatedUserId,
+                        to: peerId
+                    });
+                }
             }
 
         } catch (error) {
@@ -1055,76 +1119,240 @@ app.get("/", (req, res) => {
     res.send("Chat Application Backend Running");
 });
 
+app.post("/username-availability", async (req, res) => {
+    const username = typeof req.body?.username === "string"
+        ? req.body.username.trim()
+        : "";
+
+    if (!username) {
+        return res.status(400).json({
+            message: "A username is required.",
+            code: "USERNAME_REQUIRED"
+        });
+    }
+
+    try {
+        const exists = await User.exists({ username });
+        return res.status(200).json({ available: !exists });
+    } catch {
+        return res.status(500).json({
+            message: "Username availability could not be checked. Please try again.",
+            code: "USERNAME_CHECK_FAILED"
+        });
+    }
+});
+
+const identityErrorCodes = new Set([
+    "EMAIL_NOT_VERIFIED",
+    "EMAIL_MISMATCH",
+    "AMBIGUOUS_EMAIL",
+    "USERNAME_REQUIRED",
+    "USERNAME_LINK_REQUIRED",
+    "ACCOUNT_ALREADY_LINKED",
+    "ACCOUNT_LINK_CONFLICT"
+]);
+
+function sendIdentityError(res, error, fallbackMessage) {
+    if (error.code === 11000) {
+        return res.status(409).json({
+            message: "This account conflicts with an existing ChatSpace account. Sign in with its verified email or contact support to resolve the link.",
+            code: "ACCOUNT_LINK_CONFLICT"
+        });
+    }
+
+    if (identityErrorCodes.has(error.code)) {
+        return res.status(error.code === "EMAIL_NOT_VERIFIED" ? 403 : 409).json({
+            message: error.message,
+            code: error.code
+        });
+    }
+
+    return res.status(401).json({
+        message: fallbackMessage,
+        code: "AUTH_INVALID"
+    });
+}
+
 app.post("/signup", async (req, res) => {
     try {
-        const { username, email, password } = req.body;
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        const newUser = new User({
-            username,
-            email,
-            password: hashedPassword
-        });
-
-        await newUser.save();
-
-        res.status(201).json({
+        const token = req.headers.authorization?.match(/^Bearer\s+(\S+)$/i)?.[1];
+        if (!token) {
+            return res.status(401).json({ message: "A Firebase ID token is required" });
+        }
+        const decoded = await firebaseAdminAuth.verifyIdToken(token);
+        if (!decoded.email_verified) {
+            return res.status(202).json({
+                message: "Verify your email address to finish creating your ChatSpace account.",
+                code: "EMAIL_NOT_VERIFIED"
+            });
+        }
+        const user = await resolveFirebaseUser(token);
+        return res.status(201).json({
             message: "User registered successfully",
-            user: newUser
+            user: user.toObject({ transform: (doc, value) => { delete value.password; return value; } })
         });
-
     } catch (error) {
-        res.status(500).json({
-            message: "Signup failed",
-            error: error.message
-        });
+        return sendIdentityError(res, error, "Signup could not be completed. Please try again.");
     }
 });
 
 app.post("/login", async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const token = req.headers.authorization?.match(/^Bearer\s+(\S+)$/i)?.[1];
+        if (!token) {
+            return res.status(401).json({ message: "A Firebase ID token is required" });
+        }
+        const user = await resolveFirebaseUser(token);
+        return res.status(200).json({
+            message: "Login successful",
+            user: user.toObject({ transform: (doc, value) => { delete value.password; return value; } })
+        });
+    } catch (error) {
+        return sendIdentityError(res, error, "Login could not be completed. Check your account and try again.");
+    }
+});
 
-        const user = await User.findOne({ email });
+app.get("/account/deletion-status", authMiddleware, (req, res) => {
+    res.status(200).json({ pending: Boolean(req.user.isDeleting) });
+});
 
-        if (!user) {
-            return res.status(404).json({
-                message: "User not found"
+app.delete("/account", authMiddleware, async (req, res) => {
+    const userId = req.user.userId;
+
+    try {
+        const account = await User.findById(userId);
+        if (!account) {
+            return res.status(404).json({ message: "Account not found." });
+        }
+
+        if (!account.isDeleting && (!req.user.authTime || Date.now() / 1000 - req.user.authTime > 300)) {
+            return res.status(403).json({
+                message: "Please reauthenticate and retry account deletion.",
+                code: "REAUTHENTICATION_REQUIRED"
             });
         }
 
-        const isPasswordCorrect = await bcrypt.compare(
-            password,
-            user.password
+        const ownedGroups = await Group.find({ admin: userId }).select("_id members");
+        const groupTransfers = [];
+        for (const group of ownedGroups) {
+            const otherMemberIds = group.members
+                .map((memberId) => memberId.toString())
+                .filter((memberId) => memberId !== userId);
+            const successor = await User.findOne({
+                _id: { $in: otherMemberIds },
+                isDeleted: { $ne: true },
+                isDeleting: { $ne: true }
+            }).select("_id").sort({ _id: 1 });
+
+            if (!successor) {
+                return res.status(409).json({
+                    message: "Transfer group ownership or add another member before deleting your account.",
+                    code: "GROUP_OWNERSHIP_TRANSFER_REQUIRED"
+                });
+            }
+            groupTransfers.push({ groupId: group._id, successorId: successor._id });
+        }
+
+        if (!account.isDeleting) {
+            account.isDeleting = true;
+            await account.save();
+        }
+
+        const activePeerId = activeCallsByUser.get(userId);
+        if (activePeerId) terminateActiveCall(userId, activePeerId);
+        io.in(userId).disconnectSockets(true);
+
+        for (const transfer of groupTransfers) {
+            await Group.updateOne(
+                { _id: transfer.groupId, admin: userId },
+                { $set: { admin: transfer.successorId } }
+            );
+        }
+
+        await Group.updateMany(
+            { members: userId },
+            { $pull: { members: userId } }
         );
 
-        if (!isPasswordCorrect) {
-            return res.status(401).json({
-                message: "Invalid password"
-            });
-        }
-
-        const token = jwt.sign(
+        await User.updateMany(
+            { _id: { $ne: userId } },
             {
-                userId: user._id,
-                email: user.email
-            },
-            process.env.JWT_SECRET,
-            {
-                expiresIn: "1h"
+                $pull: {
+                    blockedUsers: userId,
+                    hiddenConversations: userId
+                }
             }
         );
 
-        res.status(200).json({
-            message: "Login successful",
-            token: token
-        });
+        await Message.updateMany(
+            { $or: [
+                { starredBy: userId },
+                { deliveredTo: userId },
+                { readBy: userId },
+                { deletedFor: userId }
+            ] },
+            {
+                $pull: {
+                    starredBy: userId,
+                    deliveredTo: userId,
+                    readBy: userId,
+                    deletedFor: userId
+                }
+            }
+        );
+        await Message.updateMany(
+            { groupId: { $exists: true, $ne: null }, senderId: userId },
+            { $set: { senderName: "Deleted user" } }
+        );
+        await Message.updateMany(
+            { "replyTo.senderName": account.username },
+            { $set: { "replyTo.senderName": "Deleted user" } }
+        );
 
+        if (account.profilePhoto?.startsWith("/uploads/")) {
+            const photoPath = path.resolve(uploadFolder, path.basename(account.profilePhoto));
+            if (path.dirname(photoPath) === path.resolve(uploadFolder)) {
+                try {
+                    await fs.promises.unlink(photoPath);
+                } catch (error) {
+                    if (error.code !== "ENOENT") throw error;
+                }
+            }
+        }
+
+        try {
+            await firebaseAdminAuth.deleteUser(req.user.firebaseUid);
+        } catch (error) {
+            if (error.code !== "auth/user-not-found") throw error;
+        }
+
+        const tombstoneId = userId.toString();
+        await User.updateOne(
+            { _id: userId },
+            {
+                $set: {
+                    username: `Deleted user ${tombstoneId.slice(-6)}`,
+                    email: `deleted-${tombstoneId}@deleted.invalid`,
+                    profilePhoto: null,
+                    isOnline: false,
+                    isDeleting: false,
+                    isDeleted: true,
+                    deletedAt: new Date(),
+                    blockedUsers: [],
+                    hiddenConversations: []
+                },
+                $unset: { firebaseUid: "", password: "", about: "" }
+            }
+        );
+
+        return res.status(200).json({
+            message: "Your account has been deleted. Existing private and group messages and their attachments are retained for other participants; your profile photo and account credentials were removed."
+        });
     } catch (error) {
-        res.status(500).json({
-            message: "Login failed",
-            error: error.message
+        console.error("Account deletion cleanup failed", error.code || error.name || "unknown");
+        return res.status(500).json({
+            message: "Account deletion is incomplete. Your account is locked while cleanup is pending; retry deletion to finish.",
+            code: "ACCOUNT_DELETION_PENDING"
         });
     }
 });
@@ -1300,9 +1528,10 @@ app.delete(
 
 app.get("/users", authMiddleware, async (req, res) => {
     try {
+        const currentUser = await User.findById(req.user.userId).select("hiddenConversations");
         const users = await User.find({
-            _id: { $ne: req.user.userId }
-        }).select("-password");
+            _id: { $ne: req.user.userId, $nin: currentUser?.hiddenConversations || [] }
+        }).select("username email about profilePhoto isOnline isDeleted");
 
         res.status(200).json({
             message: "Users fetched successfully",
@@ -1317,14 +1546,95 @@ app.get("/users", authMiddleware, async (req, res) => {
     }
 });
 
+app.get("/blocked-users", authMiddleware, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.userId)
+            .populate("blockedUsers", "username profilePhoto isDeleted");
+        return res.status(200).json({
+            users: (user?.blockedUsers || []).filter((blockedUser) => !blockedUser.isDeleted)
+        });
+    } catch {
+        return res.status(500).json({ message: "Blocked users could not be loaded." });
+    }
+});
+
+app.post("/users/:userId/block", authMiddleware, async (req, res) => {
+    const targetId = req.params.userId;
+    const currentUserId = req.user.userId;
+    if (!mongoose.Types.ObjectId.isValid(targetId) || targetId === currentUserId) {
+        return res.status(400).json({ message: "Choose a valid user to block." });
+    }
+
+    try {
+        const target = await User.findOne({ _id: targetId, isDeleted: { $ne: true } }).select("_id");
+        if (!target) return res.status(404).json({ message: "User not found." });
+        await User.updateOne({ _id: currentUserId }, { $addToSet: { blockedUsers: targetId } });
+        terminateActiveCall(currentUserId, targetId);
+        return res.status(200).json({ message: "User blocked." });
+    } catch {
+        return res.status(500).json({ message: "User could not be blocked. Please try again." });
+    }
+});
+
+app.delete("/users/:userId/block", authMiddleware, async (req, res) => {
+    const targetId = req.params.userId;
+    if (!mongoose.Types.ObjectId.isValid(targetId) || targetId === req.user.userId) {
+        return res.status(400).json({ message: "Choose a valid user to unblock." });
+    }
+
+    try {
+        await User.updateOne({ _id: req.user.userId }, { $pull: { blockedUsers: targetId } });
+        return res.status(200).json({ message: "User unblocked." });
+    } catch {
+        return res.status(500).json({ message: "User could not be unblocked. Please try again." });
+    }
+});
+
+app.delete("/conversations/:userId", authMiddleware, async (req, res) => {
+    const otherUserId = req.params.userId;
+    const currentUserId = req.user.userId;
+    if (!mongoose.Types.ObjectId.isValid(otherUserId) || otherUserId === currentUserId) {
+        return res.status(400).json({ message: "Choose a valid conversation." });
+    }
+
+    try {
+        const otherUser = await User.findById(otherUserId).select("_id");
+        if (!otherUser) return res.status(404).json({ message: "Conversation not found." });
+        await Message.updateMany(
+            {
+                $or: [
+                    { senderId: currentUserId, receiverId: otherUserId },
+                    { senderId: otherUserId, receiverId: currentUserId }
+                ]
+            },
+            { $addToSet: { deletedFor: currentUserId } }
+        );
+        await User.updateOne(
+            { _id: currentUserId },
+            { $addToSet: { hiddenConversations: otherUserId } }
+        );
+        io.to(currentUserId).emit("conversationRemoved", { userId: otherUserId });
+        return res.status(200).json({ message: "Conversation removed from your view." });
+    } catch {
+        return res.status(500).json({ message: "Conversation could not be removed. Please try again." });
+    }
+});
+
 app.post("/messages", authMiddleware, async (req, res) => {
     try {
         const { receiverId, message } = req.body;
 
-        if (!receiverId || !message) {
+        if (!mongoose.Types.ObjectId.isValid(receiverId) || !message || receiverId === req.user.userId) {
             return res.status(400).json({
                 message: "Receiver ID and message are required"
             });
+        }
+
+        if (
+            !(await User.exists({ _id: receiverId, isDeleted: { $ne: true } })) ||
+            await areUsersBlocked(req.user.userId, receiverId)
+        ) {
+            return res.status(403).json({ message: "Private messaging is unavailable for this user." });
         }
 
         const newMessage = new Message({
@@ -1334,6 +1644,13 @@ app.post("/messages", authMiddleware, async (req, res) => {
         });
 
         await newMessage.save();
+
+        await Promise.all([
+            User.updateOne({ _id: req.user.userId }, { $pull: { hiddenConversations: receiverId } }),
+            User.updateOne({ _id: receiverId }, { $pull: { hiddenConversations: req.user.userId } })
+        ]);
+        io.to(req.user.userId).emit("conversationRestored", { userId: receiverId });
+        io.to(receiverId).emit("conversationRestored", { userId: req.user.userId });
 
         res.status(201).json({
             message: "Message sent successfully",
@@ -1433,5 +1750,3 @@ mongoose.connect(process.env.MONGO_URI)
     .catch((error) => {
         console.log("MongoDB Connection Failed:", error);
     });
-
-    

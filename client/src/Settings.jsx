@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import axios from "axios";
 import {
     Bell,
     ChevronRight,
@@ -10,6 +12,8 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import socket from "./socket";
+import { EmailAuthProvider, reauthenticateWithCredential, signOut } from "firebase/auth";
+import { auth } from "./firebase";
 
 const settingsSections = [
     {
@@ -90,11 +94,74 @@ const settingsSections = [
 
 function Settings() {
     const navigate = useNavigate();
+    const [blockedUsers, setBlockedUsers] = useState([]);
+    const [accountActionError, setAccountActionError] = useState("");
+    const [accountDeletionPending, setAccountDeletionPending] = useState(false);
+    const [deletingAccount, setDeletingAccount] = useState(false);
+
+    useEffect(() => {
+        axios.get("http://localhost:3030/blocked-users")
+            .then((response) => setBlockedUsers(response.data.users || []))
+            .catch(() => {});
+        axios.get("http://localhost:3030/account/deletion-status")
+            .then((response) => setAccountDeletionPending(Boolean(response.data.pending)))
+            .catch(() => {});
+    }, []);
 
     const logout = () => {
         sessionStorage.removeItem("token");
         socket.disconnect();
+        signOut(auth);
         navigate("/");
+    };
+
+    const unblockUser = async (user) => {
+        try {
+            await axios.delete(`http://localhost:3030/users/${user._id}/block`);
+            setBlockedUsers((previous) => previous.filter((blockedUser) => blockedUser._id !== user._id));
+        } catch (error) {
+            setAccountActionError(error.response?.data?.message || "User could not be unblocked.");
+        }
+    };
+
+    const deleteAccount = async () => {
+        const confirmed = window.confirm(
+            "Permanently delete your ChatSpace account? Your profile and profile photo will be removed. Private and group messages and attachments will remain for other participants with your sender identity anonymized. You will be removed from groups; ownership transfers to another member. This cannot be undone."
+        );
+        if (!confirmed) return;
+
+        setAccountActionError("");
+        setDeletingAccount(true);
+        try {
+            if (!accountDeletionPending) {
+                const currentUser = auth.currentUser;
+                if (!currentUser?.email) throw new Error("Sign in again before deleting your account.");
+                const password = window.prompt("Re-enter your password to confirm account deletion:");
+                if (password === null) return;
+                const credential = EmailAuthProvider.credential(currentUser.email, password);
+                await reauthenticateWithCredential(currentUser, credential);
+                await currentUser.getIdToken(true);
+            }
+
+            const response = await axios.delete("http://localhost:3030/account");
+            window.alert(response.data.message || "Your account has been deleted.");
+            sessionStorage.removeItem("token");
+            socket.disconnect();
+            await signOut(auth);
+            navigate("/");
+        } catch (error) {
+            const code = error.response?.data?.code;
+            if (code === "ACCOUNT_DELETION_PENDING") setAccountDeletionPending(true);
+            if (code === "REAUTHENTICATION_REQUIRED") setAccountDeletionPending(false);
+            setAccountActionError(
+                error.response?.data?.message ||
+                (error.code?.startsWith("auth/")
+                    ? "Reauthentication failed. Check your password and try again."
+                    : error.message || "Account deletion failed.")
+            );
+        } finally {
+            setDeletingAccount(false);
+        }
     };
 
     return (
@@ -177,9 +244,43 @@ function Settings() {
                 ))}
 
                 <section className="cs-settings-section">
+                    <h2>PRIVACY</h2>
+                    <div className="cs-settings-card">
+                        <div style={{ padding: "16px" }}>
+                            <strong>Blocked users</strong>
+                            {blockedUsers.length === 0 ? (
+                                <p className="cs-info-muted">You have no blocked users.</p>
+                            ) : blockedUsers.map((user) => (
+                                <div key={user._id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", paddingTop: "12px" }}>
+                                    <span>{user.username}</span>
+                                    <button type="button" onClick={() => unblockUser(user)}>Unblock</button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </section>
+
+                {accountActionError && (
+                    <p role="alert" style={{ color: "#b42318", padding: "0 16px" }}>{accountActionError}</p>
+                )}
+
+                <section className="cs-settings-section">
                     <h2>ACCOUNT ACTION</h2>
 
                     <div className="cs-settings-card">
+                        <button
+                            type="button"
+                            className="cs-settings-row"
+                            onClick={deleteAccount}
+                            disabled={deletingAccount}
+                            style={{ color: "#b42318" }}
+                        >
+                            <span className="cs-settings-copy">
+                                <strong>{deletingAccount ? "Deleting account..." : accountDeletionPending ? "Retry account deletion" : "Delete my account"}</strong>
+                                <small>Permanently remove your account and profile data</small>
+                            </span>
+                            <ChevronRight size={17} className="cs-settings-chevron" />
+                        </button>
                         <button
                             type="button"
                             className="cs-settings-row cs-logout-row"

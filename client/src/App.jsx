@@ -1,45 +1,27 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { jwtDecode } from "jwt-decode";
 import axios from "axios";
+import { signOut } from "firebase/auth";
+import { auth } from "./firebase";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
-import Cropper from "react-easy-crop";
 import {
     ArrowLeft,
-    Bell,
-    Camera,
-    ChevronDown,
     ChevronRight,
-    Check,
     FileText,
-    Image,
-    Loader,
     LogOut,
     MessageCircle,
     Mic,
-    Minus,
-    MoreVertical,
-    Paperclip,
-    Palette,
     Phone,
     LockKeyhole,
-    Plus,
-    RotateCcw,
-    RotateCw,
     Search,
     Send,
     Settings,
-    Shield,
     Smile,
-    StopCircle,
-    Trash2,
     UserRound,
     UsersRound,
     Video,
     X,
-    ZoomIn,
-    ZoomOut,
     Info
 } from "lucide-react";
 
@@ -95,6 +77,7 @@ function App() {
     const [userId, setUserId] = useState("");
     const [profileUser, setProfileUser] = useState(null);
     const [users, setUsers] = useState([]);
+    const [blockedUserIds, setBlockedUserIds] = useState([]);
     const [groups, setGroups] = useState([]);
     const [selectedGroup, setSelectedGroup] = useState(null);
     const [showAddMembers, setShowAddMembers] = useState(false);
@@ -122,22 +105,7 @@ function App() {
     const [activeFilter, setActiveFilter] = useState("all");
     const [showProfileMenu, setShowProfileMenu] = useState(false);
     const [showInfoPanel, setShowInfoPanel] = useState(false);
-    const [editingAbout, setEditingAbout] = useState(false);
-    const [aboutText, setAboutText] = useState("");
-    const [aboutError, setAboutError] = useState("");
-    const [aboutSaving, setAboutSaving] = useState(false);
-    const [uploadingPhoto, setUploadingPhoto] = useState(false);
-    const [photoError, setPhotoError] = useState("");
-    const fileInputRef = useRef(null);
-    const [showPhotoMenu, setShowPhotoMenu] = useState(false);
-    const [showPhotoEditor, setShowPhotoEditor] = useState(false);
-    const [editImageUrl, setEditImageUrl] = useState(null);
-    const [crop, setCrop] = useState({ x: 0, y: 0 });
-    const [zoom, setZoom] = useState(1);
-    const [rotation, setRotation] = useState(0);
-    const [removingPhoto, setRemovingPhoto] = useState(false);
-    const [showViewPhoto, setShowViewPhoto] = useState(false);
-    const [theme, setTheme] = useState(
+    const [theme] = useState(
         () => localStorage.getItem("chatspace-theme") || "ocean"
     );
     const [callState, setCallState] = useState(null);
@@ -150,9 +118,6 @@ function App() {
     const peerConnectionRef = useRef(null);
     const localStreamRef = useRef(null);
     const pendingIceCandidatesRef = useRef([]);
-    const localVideoRef = useRef(null);
-    const remoteVideoRef = useRef(null);
-    const remoteAudioRef = useRef(null);
 
     useEffect(() => {
         document.documentElement.dataset.theme = theme;
@@ -197,216 +162,7 @@ useEffect(() => {
         });
     };
 
-    const handleEditAbout = () => {
-        setAboutText(selectedUser?.about || "");
-        setAboutError("");
-        setEditingAbout(true);
-    };
-
-    const handleCancelAbout = () => {
-        setAboutText(selectedUser?.about || "");
-        setAboutError("");
-        setEditingAbout(false);
-    };
-
-    const handleSaveAbout = async () => {
-        if (!selectedUser) return;
-        setAboutSaving(true);
-        setAboutError("");
-        try {
-            const token = sessionStorage.getItem("token");
-            const response = await axios.put(
-                "http://localhost:3030/profile",
-                { about: aboutText.trim() },
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type": "application/json"
-                    }
-                }
-            );
-            setSelectedUser((prev) =>
-                prev ? { ...prev, about: response.data.user.about } : prev
-            );
-            setEditingAbout(false);
-        } catch (error) {
-            setAboutError(
-                error.response?.data?.message ||
-                error.response?.data?.error ||
-                "Failed to update About. Please try again."
-            );
-        } finally {
-            setAboutSaving(false);
-        }
-    };
-
-    const handlePhotoClick = () => {
-        if (selectedUser) {
-            setShowPhotoMenu(true);
-        }
-    };
-
-    const closePhotoMenu = () => {
-        setShowPhotoMenu(false);
-    };
-
-    const handleViewPhoto = () => {
-        if (selectedUser?.profilePhoto) {
-            setShowViewPhoto(true);
-        }
-        closePhotoMenu();
-    };
-
-    const handleChangePhoto = () => {
-        closePhotoMenu();
-        fileInputRef.current?.click();
-    };
-
-    const handleRemovePhoto = async () => {
-        if (!selectedUser || !selectedUser.profilePhoto) return;
-
-        const confirmed = window.confirm(
-            "Are you sure you want to remove your profile photo? This action cannot be undone."
-        );
-        if (!confirmed) {
-            closePhotoMenu();
-            return;
-        }
-
-        closePhotoMenu();
-        setRemovingPhoto(true);
-        setPhotoError("");
-
-        try {
-            const token = sessionStorage.getItem("token");
-            await axios.delete("http://localhost:3030/profile/photo", {
-                headers: {
-                    Authorization: `Bearer ${token}`
-                }
-            });
-
-            setSelectedUser((prev) =>
-                prev ? { ...prev, profilePhoto: null } : prev
-            );
-
-            setUsers((prevUsers) =>
-                prevUsers.map((user) =>
-                    user._id === userId ? { ...user, profilePhoto: null } : user
-                )
-            );
-
-            setProfileUser((prev) =>
-                prev ? { ...prev, profilePhoto: null } : prev
-            );
-
-        } catch (error) {
-            setPhotoError(
-                error.response?.data?.message ||
-                error.response?.data?.error ||
-                "Failed to remove photo. Please try again."
-            );
-        } finally {
-            setRemovingPhoto(false);
-        }
-    };
-
-    const handlePhotoChange = async (e) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-
-        if (!file.type.startsWith("image/")) {
-            setPhotoError("Please select an image file.");
-            e.target.value = "";
-            return;
-        }
-
-        const maxSize = 5 * 1024 * 1024;
-        if (file.size > maxSize) {
-            setPhotoError("Image size must be less than 5 MB.");
-            e.target.value = "";
-            return;
-        }
-
-        setPhotoError("");
-        const objectUrl = URL.createObjectURL(file);
-        setEditImageUrl(objectUrl);
-        setCrop({ x: 0, y: 0 });
-        setZoom(1);
-        setRotation(0);
-        setShowPhotoEditor(true);
-        e.target.value = "";
-    };
-
-    const handleCropComplete = async (croppedCanvas) => {
-        if (!croppedCanvas) return;
-
-        setUploadingPhoto(true);
-        setPhotoError("");
-
-        try {
-            const token = sessionStorage.getItem("token");
-            const blob = await new Promise((resolve) =>
-                croppedCanvas.toBlob(resolve, "image/jpeg", 0.9)
-            );
-            const formData = new FormData();
-            formData.append("file", blob, "profile.jpg");
-
-            const response = await axios.put(
-                "http://localhost:3030/profile/photo",
-                formData,
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`
-                    }
-                }
-            );
-
-            const newPhotoUrl = response.data.profilePhoto;
-
-            setSelectedUser((prev) =>
-                prev ? { ...prev, profilePhoto: newPhotoUrl } : prev
-            );
-
-            setUsers((prevUsers) =>
-                prevUsers.map((user) =>
-                    user._id === userId ? { ...user, profilePhoto: newPhotoUrl } : user
-                )
-            );
-
-            setProfileUser((prev) =>
-                prev ? { ...prev, profilePhoto: newPhotoUrl } : prev
-            );
-
-            setShowPhotoEditor(false);
-            if (editImageUrl) {
-                URL.revokeObjectURL(editImageUrl);
-                setEditImageUrl(null);
-            }
-
-        } catch (error) {
-            setPhotoError(
-                error.response?.data?.message ||
-                error.response?.data?.error ||
-                "Failed to upload photo. Please try again."
-            );
-        } finally {
-            setUploadingPhoto(false);
-        }
-    };
-
-    const closePhotoEditor = () => {
-        setShowPhotoEditor(false);
-        if (editImageUrl) {
-            URL.revokeObjectURL(editImageUrl);
-            setEditImageUrl(null);
-        }
-    };
-
-    const closeViewPhoto = () => {
-        setShowViewPhoto(false);
-    };
-
-    const closeCall = (notifyPeer = false) => {
+    const closeCall = useCallback((notifyPeer = false) => {
         const peerId =
             callState?.peerId ||
             incomingCall?.from;
@@ -429,7 +185,7 @@ useEffect(() => {
         setRemoteStream(null);
         setIncomingCall(null);
         setCallState(null);
-    };
+    }, [callState, incomingCall, userId]);
 
     const createPeerConnection = (peerId) => {
         const peerConnection = new RTCPeerConnection({
@@ -481,7 +237,7 @@ useEffect(() => {
     };
 
     const startCall = async (callType) => {
-        if (!selectedUser || callState || incomingCall) {
+        if (!selectedUser || isSelectedUserBlocked || selectedUser.isDeleted || callState || incomingCall) {
             return;
         }
 
@@ -609,46 +365,81 @@ useEffect(() => {
         const token = sessionStorage.getItem("token");
 
         if (!token) {
+            socket.disconnect();
             window.location.href = "/";
             return;
         }
 
-        try {
-            const decoded = jwtDecode(token);
+        let disposed = false;
 
-            setUserId(decoded.userId);
+        const handleConnect = () => {
+            console.log("Connected:", socket.id);
+        };
 
-            const handleConnect = () => {
-                console.log("Connected:", socket.id);
-
-                socket.emit(
-                    "join",
-                    decoded.userId
-                );
-            };
-
-            if (socket.connected) {
-                handleConnect();
-            } else {
-                socket.on(
-                    "connect",
-                    handleConnect
-                );
+        const handleConnectError = (error) => {
+            if (disposed) {
+                return;
             }
 
-            return () => {
-                socket.off(
-                    "connect",
-                    handleConnect
+            if (["AUTH_REQUIRED", "AUTH_INVALID"].includes(error.data?.code)) {
+                sessionStorage.removeItem("token");
+                socket.disconnect();
+                signOut(auth);
+                window.location.href = "/";
+                return;
+            }
+
+            console.error("Socket connection error:", error.message);
+        };
+
+        socket.on("connect", handleConnect);
+        socket.on("connect_error", handleConnectError);
+
+        const authenticateAndConnect = async () => {
+            try {
+                const response = await axios.get(
+                    "http://localhost:3030/profile",
+                    {
+                        headers: {
+                            Authorization: `Bearer ${token}`
+                        }
+                    }
                 );
-            };
+                const authenticatedUserId = response.data.user?._id;
 
-        } catch (error) {
-            console.log("Token error:", error);
+                if (!authenticatedUserId) {
+                    throw new Error("Authenticated profile has no user ID");
+                }
 
-            sessionStorage.removeItem("token");
-            window.location.href = "/";
-        }
+                if (disposed) {
+                    return;
+                }
+
+                setUserId(authenticatedUserId);
+                socket.connect();
+            } catch (error) {
+                if (disposed) {
+                    return;
+                }
+
+                console.log("Token error:", error);
+
+                if (error.response?.status === 401 || error.response?.status === 404) {
+                    sessionStorage.removeItem("token");
+                    socket.disconnect();
+                    signOut(auth);
+                    window.location.href = "/";
+                }
+            }
+        };
+
+        authenticateAndConnect();
+
+        return () => {
+            disposed = true;
+            socket.off("connect", handleConnect);
+            socket.off("connect_error", handleConnectError);
+        };
     }, []);
 
     useEffect(() => {
@@ -773,7 +564,7 @@ useEffect(() => {
             socket.off("call:busy", handleCallBusy);
             socket.off("call:end", handleCallEnd);
         };
-    }, [userId, callState, incomingCall]);
+    }, [userId, callState, incomingCall, closeCall]);
 
     useEffect(() => {
         const getUsers = async () => {
@@ -875,6 +666,41 @@ useEffect(() => {
 
         getGroups();
     }, []);
+
+    useEffect(() => {
+        axios.get("http://localhost:3030/blocked-users")
+            .then((response) => {
+                setBlockedUserIds(response.data.users.map((user) => user._id.toString()));
+            })
+            .catch((error) => {
+                console.log(error.response?.data || error.message);
+            });
+    }, []);
+
+    useEffect(() => {
+        const handleConversationRemoved = (data) => {
+            if (selectedUser?._id?.toString() === data.userId?.toString()) {
+                setSelectedUser(null);
+                setMessages([]);
+                setReplyingTo(null);
+            }
+            setUsers((previous) => previous.filter((user) => user._id.toString() !== data.userId?.toString()));
+        };
+        const handleConversationRestored = async () => {
+            try {
+                const response = await axios.get("http://localhost:3030/users");
+                setUsers(response.data.users);
+            } catch (error) {
+                console.log(error.response?.data || error.message);
+            }
+        };
+        socket.on("conversationRemoved", handleConversationRemoved);
+        socket.on("conversationRestored", handleConversationRestored);
+        return () => {
+            socket.off("conversationRemoved", handleConversationRemoved);
+            socket.off("conversationRestored", handleConversationRestored);
+        };
+    }, [selectedUser]);
 
     useEffect(() => {
         const getProfile = async () => {
@@ -1254,6 +1080,57 @@ if (
         }
     };
 
+    const isSelectedUserBlocked = Boolean(
+        selectedUser && blockedUserIds.includes(selectedUser._id.toString())
+    );
+
+    const setSelectedUserBlocked = async (shouldBlock) => {
+        if (!selectedUser) return;
+        if (shouldBlock && !window.confirm(`Block ${selectedUser.username} from private messages and calls? Group chats will continue to work.`)) {
+            return;
+        }
+
+        try {
+            const url = `http://localhost:3030/users/${selectedUser._id}/block`;
+            if (shouldBlock) {
+                await axios.post(url);
+                setBlockedUserIds((ids) => ids.includes(selectedUser._id.toString()) ? ids : [...ids, selectedUser._id.toString()]);
+            } else {
+                await axios.delete(url);
+                setBlockedUserIds((ids) => ids.filter((id) => id !== selectedUser._id.toString()));
+            }
+        } catch (error) {
+            window.alert(error.response?.data?.message || "Privacy settings could not be updated.");
+        }
+    };
+
+    const removeSelectedConversation = async () => {
+        if (!selectedUser || !window.confirm("Remove this conversation from your view? The other person’s history will not be changed.")) {
+            return;
+        }
+
+        try {
+            await axios.delete(`http://localhost:3030/conversations/${selectedUser._id}`);
+            setMessages([]);
+            setUsers((previous) => previous.filter((user) => user._id !== selectedUser._id));
+            setSelectedUser(null);
+            setShowInfoPanel(false);
+            setReplyingTo(null);
+            setLastMessages((previous) => {
+                const next = { ...previous };
+                delete next[selectedUser._id];
+                return next;
+            });
+            setUnreadCounts((previous) => {
+                const next = { ...previous };
+                delete next[selectedUser._id];
+                return next;
+            });
+        } catch (error) {
+            window.alert(error.response?.data?.message || "Conversation could not be removed.");
+        }
+    };
+
     const selectGroup = async (group) => {
         setSelectedGroup(group);
         setSelectedUser(null);
@@ -1473,6 +1350,11 @@ if (
     };
 
     const sendMessage = () => {
+        if (selectedUser && (isSelectedUserBlocked || selectedUser.isDeleted)) {
+            alert("Private messaging is unavailable for this user.");
+            return;
+        }
+
         if (
             !message.trim() ||
             !selectedUser
@@ -1609,6 +1491,12 @@ if (
             return;
         }
 
+        if (selectedUser && (isSelectedUserBlocked || selectedUser.isDeleted)) {
+            alert("Private attachments are unavailable for this user.");
+            input.value = "";
+            return;
+        }
+
         if (file.size > 10 * 1024 * 1024) {
             alert("File size must be less than 10 MB");
             input.value = "";
@@ -1674,6 +1562,11 @@ if (
     };
 
     const startRecording = async () => {
+        if (selectedUser && (isSelectedUserBlocked || selectedUser.isDeleted)) {
+            alert("Private voice messages are unavailable for this user.");
+            return;
+        }
+
         let stream;
 
         try {
@@ -1913,6 +1806,7 @@ if (
         }
 
         return (
+            msg.senderName ||
             selectedGroup.members.find(
                 (member) =>
                     member._id?.toString() ===
@@ -2258,6 +2152,7 @@ if (
                                             }
                                             sessionStorage.removeItem("token");
                                             socket.disconnect();
+                                            signOut(auth);
                                             navigate("/");
                                         }}
                                     >
@@ -2546,36 +2441,9 @@ if (
                                             "relative"
                                     }}
                                 >
-                                {user.profilePhoto ? (
-                                    <img
-                                        src={`http://localhost:3030${user.profilePhoto}`}
-                                        alt={user.username}
-                                        style={{
-                                            width: "48px",
-                                            height: "48px",
-                                            borderRadius: "50%",
-                                            objectFit: "cover"
-                                        }}
-                                    />
-                                ) : (
-                                    <div
-                                        style={{
-                                            width: "48px",
-                                            height: "48px",
-                                            borderRadius: "50%",
-                                            background: "#dfe5e7",
-                                            display: "flex",
-                                            alignItems: "center",
-                                            justifyContent: "center",
-                                            fontSize: "21px",
-                                            position: "relative"
-                                        }}
-                                    >
-                                        👤
-                                    </div>
-                                )}
+                                    👤
 
-                                {user.isOnline && (
+                                    {user.isOnline && (
                                         <span
                                             style={{
                                                 position: "absolute",
@@ -2850,33 +2718,20 @@ if (
         textAlign: "left"
     }}
 >
-    {selectedUser.profilePhoto ? (
-        <img
-            src={`http://localhost:3030${selectedUser.profilePhoto}`}
-            alt={selectedUser.username}
-            style={{
-                width: "48px",
-                height: "48px",
-                borderRadius: "50%",
-                objectFit: "cover"
-            }}
-        />
-    ) : (
-        <div
-            style={{
-                width: "48px",
-                height: "48px",
-                borderRadius: "50%",
-                background: "#dfe5e7",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: "21px"
-            }}
-        >
-            👤
-        </div>
-    )}
+    <div
+        style={{
+            width: "48px",
+            height: "48px",
+            borderRadius: "50%",
+            background: "#dfe5e7",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: "21px"
+        }}
+    >
+        👤
+    </div>
 
     <div>
         <strong>
@@ -2918,7 +2773,7 @@ if (
                                     aria-label="Start voice call"
                                     title="Voice call"
                                     onClick={() => startCall("audio")}
-                                    disabled={Boolean(callState || incomingCall)}
+                                    disabled={Boolean(callState || incomingCall || isSelectedUserBlocked || selectedUser?.isDeleted)}
                                 >
                                     <Phone size={18} />
                                 </button>
@@ -2927,7 +2782,7 @@ if (
                                     aria-label="Start video call"
                                     title="Video call"
                                     onClick={() => startCall("video")}
-                                    disabled={Boolean(callState || incomingCall)}
+                                    disabled={Boolean(callState || incomingCall || isSelectedUserBlocked || selectedUser?.isDeleted)}
                                 >
                                     <Video size={18} />
                                 </button>
@@ -3967,7 +3822,7 @@ if (
                                         }
                                         style={{
                                             display:
-                                                "non+e"
+                                                "none"
                                         }}
                                     />
                                 </label>
@@ -4213,156 +4068,16 @@ if (
     <>
         <div className="cs-info-profile">
 
-            <div style={{ position: "relative", display: "inline-block" }}>
-                {selectedUser.profilePhoto ? (
-                    <img
-                        className="cs-info-avatar"
-                        src={`http://localhost:3030${selectedUser.profilePhoto}`}
-                        alt={selectedUser.username}
-                        onClick={handlePhotoClick}
-                        style={{ cursor: "pointer", borderRadius: "50%", objectFit: "cover" }}
-                    />
-                ) : (
-                    <div
-                        className="cs-info-avatar"
-                        onClick={handlePhotoClick}
-                        style={{ cursor: "pointer" }}
-                    >
-                        <UserRound size={34} />
-                    </div>
-                )}
-
-                {(uploadingPhoto || removingPhoto) && (
-                    <div
-                        style={{
-                            position: "absolute",
-                            inset: 0,
-                            borderRadius: "50%",
-                            background: "rgba(0,0,0,0.5)",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            color: "#ffffff",
-                            fontSize: "11px",
-                            fontWeight: 500
-                        }}
-                    >
-                        <Loader size={20} className="cs-spin" />
-                        <span style={{ marginLeft: "6px" }}>
-                            {uploadingPhoto ? "Uploading..." : "Removing..."}
-                        </span>
-                    </div>
-                )}
-
-                <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handlePhotoChange}
-                    style={{ display: "none" }}
+            {selectedUser.profilePhoto ? (
+                <img
+                    className="cs-info-avatar"
+                    src={`http://localhost:3030${selectedUser.profilePhoto}`}
+                    alt={selectedUser.username}
                 />
-            </div>
-
-            {showPhotoMenu && (
-                <div
-                    style={{
-                        position: "absolute",
-                        top: "100%",
-                        left: "50%",
-                        transform: "translateX(-50%)",
-                        marginTop: "8px",
-                        zIndex: 1000,
-                        background: "#ffffff",
-                        border: "1px solid #d1d7db",
-                        borderRadius: "8px",
-                        boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-                        minWidth: "180px",
-                        overflow: "hidden"
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                >
-                    {selectedUser.profilePhoto && (
-                        <button
-                            type="button"
-                            onClick={handleViewPhoto}
-                            style={{
-                                width: "100%",
-                                padding: "10px 16px",
-                                border: "none",
-                                background: "transparent",
-                                color: "#111111",
-                                fontSize: "14px",
-                                textAlign: "left",
-                                cursor: "pointer",
-                                display: "flex",
-                                alignItems: "center",
-                                gap: "10px"
-                            }}
-                            onMouseEnter={(e) => { e.currentTarget.style.background = "#f0f2f5"; }}
-                            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                        >
-                            <Image size={18} />
-                            View photo
-                        </button>
-                    )}
-                    <button
-                        type="button"
-                        onClick={handleChangePhoto}
-                        disabled={uploadingPhoto || removingPhoto}
-                        style={{
-                            width: "100%",
-                            padding: "10px 16px",
-                            border: "none",
-                            background: "transparent",
-                            color: uploadingPhoto || removingPhoto ? "#999999" : "#128c7e",
-                            fontSize: "14px",
-                            fontWeight: 600,
-                            textAlign: "left",
-                            cursor: uploadingPhoto || removingPhoto ? "not-allowed" : "pointer",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "10px"
-                        }}
-                        onMouseEnter={(e) => { if (!uploadingPhoto && !removingPhoto) e.currentTarget.style.background = "#e8f5e9"; }}
-                        onMouseLeave={(e) => { if (!uploadingPhoto && !removingPhoto) e.currentTarget.style.background = "transparent"; }}
-                    >
-                        <Camera size={18} />
-                        Change photo
-                    </button>
-                    {selectedUser.profilePhoto && (
-                        <>
-                            <div style={{ height: "1px", background: "#d1d7db", margin: "4px 0" }} />
-                            <button
-                                type="button"
-                                onClick={handleRemovePhoto}
-                                disabled={removingPhoto}
-                                style={{
-                                    width: "100%",
-                                    padding: "10px 16px",
-                                    border: "none",
-                                    background: "transparent",
-                                    color: removingPhoto ? "#999999" : "#d32f2f",
-                                    fontSize: "14px",
-                                    fontWeight: 600,
-                                    textAlign: "left",
-                                    cursor: removingPhoto ? "not-allowed" : "pointer",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: "10px"
-                                }}
-                                onMouseEnter={(e) => { if (!removingPhoto) e.currentTarget.style.background = "#fef2f2"; }}
-                                onMouseLeave={(e) => { if (!removingPhoto) e.currentTarget.style.background = "transparent"; }}
-                            >
-                                <Trash2 size={18} />
-                                Remove photo
-                            </button>
-                        </>
-                    )}
+            ) : (
+                <div className="cs-info-avatar">
+                    <UserRound size={34} />
                 </div>
-            )}
-
-            {photoError && (
-                <p style={{ marginTop: "8px", color: "#d32f2f", fontSize: "12px", textAlign: "center" }}>{photoError}</p>
             )}
 
             <strong className="cs-info-username">
@@ -4376,110 +4091,12 @@ if (
             </span>
 
             <div className="cs-info-about">
-                {!editingAbout ? (
-                    <>
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
-                            <span>About</span>
-                            <button
-                                type="button"
-                                onClick={handleEditAbout}
-                                style={{
-                                    border: "none",
-                                    background: "transparent",
-                                    color: "#128c7e",
-                                    fontSize: "13px",
-                                    fontWeight: 600,
-                                    cursor: "pointer",
-                                    padding: "2px 8px",
-                                    borderRadius: "4px"
-                                }}
-                                onMouseEnter={(e) => { e.currentTarget.style.background = "#e8f5e9"; }}
-                                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                            >
-                                Edit
-                            </button>
-                        </div>
-                        <p style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                            {selectedUser.about || "Hey there! I am using chatSpace"}
-                        </p>
-                    </>
-                ) : (
-                    <>
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
-                            <span>About</span>
-                        </div>
-                        <textarea
-                            value={aboutText}
-                            onChange={(e) => {
-                                const val = e.target.value;
-                                if (val.length <= 150) setAboutText(val);
-                            }}
-                            maxLength={150}
-                            rows={3}
-                            style={{
-                                width: "100%",
-                                boxSizing: "border-box",
-                                padding: "10px",
-                                border: "1px solid #d1d7db",
-                                borderRadius: "8px",
-                                fontSize: "14px",
-                                fontFamily: "inherit",
-                                resize: "vertical",
-                                outline: "none",
-                                background: "#ffffff",
-                                color: "#111111"
-                            }}
-                            placeholder="What's on your mind?"
-                            aria-label="About"
-                        />
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "8px" }}>
-                            <span style={{ fontSize: "12px", color: aboutText.length >= 150 ? "#d32f2f" : "#667781" }}>
-                                {aboutText.length}/150
-                            </span>
-                            <div style={{ display: "flex", gap: "8px" }}>
-                                <button
-                                    type="button"
-                                    onClick={handleCancelAbout}
-                                    disabled={aboutSaving}
-                                    style={{
-                                        padding: "8px 16px",
-                                        border: "1px solid #d1d7db",
-                                        borderRadius: "6px",
-                                        background: "#ffffff",
-                                        color: "#111111",
-                                        fontSize: "13px",
-                                        fontWeight: 500,
-                                        cursor: aboutSaving ? "not-allowed" : "pointer",
-                                        opacity: aboutSaving ? 0.6 : 1
-                                    }}
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleSaveAbout}
-                                    disabled={aboutSaving || aboutText.trim().length === 0}
-                                    style={{
-                                        padding: "8px 16px",
-                                        border: "none",
-                                        borderRadius: "6px",
-                                        background: "#128c7e",
-                                        color: "#ffffff",
-                                        fontSize: "13px",
-                                        fontWeight: 500,
-                                        cursor: (aboutSaving || aboutText.trim().length === 0) ? "not-allowed" : "pointer",
-                                        opacity: (aboutSaving || aboutText.trim().length === 0) ? 0.6 : 1
-                                    }}
-                                >
-                                    {aboutSaving ? "Saving..." : "Save"}
-                                </button>
-                            </div>
-                        </div>
-                        {aboutError && (
-                            <p style={{ marginTop: "8px", color: "#d32f2f", fontSize: "12px" }}>{aboutError}</p>
-                        )}
-                    </>
-                )}
+                <span>About</span>
+
+                <p>
+                    {selectedUser.about ||
+                        "Hey there! I am using chatSpace"}
+                </p>
             </div>
 
         </div>
@@ -4498,6 +4115,27 @@ if (
                     </strong>
                 </div>
             </div>
+        </section>
+
+        <section className="cs-info-section">
+            <h3>Privacy controls</h3>
+            <p className="cs-info-muted">Blocking affects private messages and calls. Shared groups remain available.</p>
+            {!selectedUser.isDeleted && (
+                <button
+                    type="button"
+                    onClick={() => setSelectedUserBlocked(!isSelectedUserBlocked)}
+                    style={{ width: "100%", padding: "10px", cursor: "pointer", marginBottom: "8px" }}
+                >
+                    {isSelectedUserBlocked ? "Unblock user" : "Block user"}
+                </button>
+            )}
+            <button
+                type="button"
+                onClick={removeSelectedConversation}
+                style={{ width: "100%", padding: "10px", cursor: "pointer" }}
+            >
+                Remove conversation
+            </button>
         </section>
     </>
 ) : (
@@ -5208,309 +4846,6 @@ if (
             )}
         </div>
     );
-
-    // Photo Editor Modal
-    const PhotoEditorModal = () => {
-        if (!showPhotoEditor || !editImageUrl) return null;
-
-        const handleCrop = (croppedAreaPixels) => {
-            setCrop(croppedAreaPixels);
-        };
-
-        const handleZoomChange = (newZoom) => {
-            setZoom(newZoom);
-        };
-
-        const handleRotate = (direction) => {
-            setRotation((prev) => (prev + (direction === "left" ? -90 : 90)) % 360);
-        };
-
-        const handleReset = () => {
-            setCrop({ x: 0, y: 0 });
-            setZoom(1);
-            setRotation(0);
-        };
-
-        const getCroppedCanvas = () => {
-            const canvas = document.createElement("canvas");
-            const scaleX = zoom;
-            const scaleY = zoom;
-            const ctx = canvas.getContext("2d");
-
-            const size = Math.min(400, 400);
-            canvas.width = size;
-            canvas.height = size;
-
-            const img = new Image();
-            img.src = editImageUrl;
-
-            return new Promise((resolve) => {
-                img.onload = () => {
-                    ctx.save();
-                    ctx.translate(size / 2, size / 2);
-                    ctx.rotate((rotation * Math.PI) / 180);
-                    ctx.translate(-size / 2, -size / 2);
-
-                    const srcX = (img.width - size / scaleX) / 2 + crop.x / scaleX;
-                    const srcY = (img.height - size / scaleY) / 2 + crop.y / scaleY;
-                    const srcWidth = size / scaleX;
-                    const srcHeight = size / scaleY;
-
-                    ctx.drawImage(img, srcX, srcY, srcWidth, srcHeight, 0, 0, size, size);
-                    ctx.restore();
-                    resolve(canvas);
-                };
-            });
-        };
-
-        const handleSave = async () => {
-            const canvas = await getCroppedCanvas();
-            await handleCropComplete(canvas);
-        };
-
-        return (
-            <div
-                style={{
-                    position: "fixed",
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    zIndex: 2000,
-                    background: "rgba(0,0,0,0.8)",
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    padding: "20px"
-                }}
-                onClick={closePhotoEditor}
-            >
-                <div
-                    style={{
-                        background: "#ffffff",
-                        borderRadius: "16px",
-                        width: "100%",
-                        maxWidth: "500px",
-                        maxHeight: "90vh",
-                        display: "flex",
-                        flexDirection: "column",
-                        overflow: "hidden"
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                >
-                    <div
-                        style={{
-                            padding: "16px",
-                            borderBottom: "1px solid #d1d7db",
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center"
-                        }}
-                    >
-                        <h3 style={{ margin: 0, fontSize: "18px" }}>Edit Photo</h3>
-                        <div style={{ display: "flex", gap: "8px" }}>
-                            <button
-                                type="button"
-                                onClick={closePhotoEditor}
-                                style={{
-                                    padding: "8px 16px",
-                                    border: "1px solid #d1d7db",
-                                    borderRadius: "8px",
-                                    background: "#ffffff",
-                                    color: "#111111",
-                                    cursor: "pointer"
-                                }}
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                type="button"
-                                onClick={handleSave}
-                                disabled={uploadingPhoto}
-                                style={{
-                                    padding: "8px 16px",
-                                    border: "none",
-                                    borderRadius: "8px",
-                                    background: "#128c7e",
-                                    color: "#ffffff",
-                                    cursor: uploadingPhoto ? "not-allowed" : "pointer",
-                                    opacity: uploadingPhoto ? 0.6 : 1
-                                }}
-                            >
-                                {uploadingPhoto ? "Saving..." : "Save photo"}
-                            </button>
-                        </div>
-                    </div>
-
-                    <div
-                        style={{
-                            flex: 1,
-                            display: "flex",
-                            flexDirection: "column",
-                            alignItems: "center",
-                            padding: "20px",
-                            overflow: "auto",
-                            background: "#f0f2f5"
-                        }}
-                    >
-                        <div style={{ position: "relative", width: "100%", maxWidth: "400px" }}>
-                            <Cropper
-                                image={editImageUrl}
-                                crop={crop}
-                                zoom={zoom}
-                                rotation={rotation}
-                                aspect={1}
-                                onCropChange={handleCrop}
-                                onZoomChange={handleZoomChange}
-                                style={{
-                                    width: "100%",
-                                    height: "400px",
-                                    background: "#e8eaed",
-                                    borderRadius: "8px"
-                                }}
-                            />
-                        </div>
-
-                        <div style={{ padding: "16px 0", width: "100%", maxWidth: "400px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
-                                <button
-                                    type="button"
-                                    onClick={() => handleRotate("left")}
-                                    disabled={uploadingPhoto}
-                                    style={{
-                                        padding: "8px",
-                                        border: "1px solid #d1d7db",
-                                        borderRadius: "8px",
-                                        background: "#ffffff",
-                                        cursor: uploadingPhoto ? "not-allowed" : "pointer"
-                                    }}
-                                >
-                                    <RotateCcw size={20} />
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={() => handleRotate("right")}
-                                    disabled={uploadingPhoto}
-                                    style={{
-                                        padding: "8px",
-                                        border: "1px solid #d1d7db",
-                                        borderRadius: "8px",
-                                        background: "#ffffff",
-                                        cursor: uploadingPhoto ? "not-allowed" : "pointer"
-                                    }}
-                                >
-                                    <RotateCw size={20} />
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleReset}
-                                    disabled={uploadingPhoto}
-                                    style={{
-                                        padding: "8px 12px",
-                                        border: "1px solid #d1d7db",
-                                        borderRadius: "8px",
-                                        background: "#ffffff",
-                                        color: "#111111",
-                                        fontSize: "13px",
-                                        cursor: uploadingPhoto ? "not-allowed" : "pointer"
-                                    }}
-                                >
-                                    Reset
-                                </button>
-                            </div>
-
-                            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                                <ZoomOut size={20} color="#667781" />
-                                <input
-                                    type="range"
-                                    min="1"
-                                    max="3"
-                                    step="0.1"
-                                    value={zoom}
-                                    onChange={(e) => handleZoomChange(parseFloat(e.target.value))}
-                                    disabled={uploadingPhoto}
-                                    style={{ flex: 1 }}
-                                />
-                                <ZoomIn size={20} color="#667781" />
-                                <span style={{ fontSize: "13px", color: "#667781", minWidth: "40px" }}>
-                                    {Math.round(zoom * 100)}%
-                                </span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        );
-    };
-
-    // View Photo Modal
-    const ViewPhotoModal = () => {
-        if (!showViewPhoto || !selectedUser?.profilePhoto) return null;
-
-        return (
-            <div
-                style={{
-                    position: "fixed",
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    zIndex: 2000,
-                    background: "rgba(0,0,0,0.9)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    padding: "20px"
-                }}
-                onClick={closeViewPhoto}
-            >
-                <div
-                    style={{
-                        position: "relative",
-                        maxWidth: "90vw",
-                        maxHeight: "90vh"
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                >
-                    <button
-                        type="button"
-                        onClick={closeViewPhoto}
-                        style={{
-                            position: "absolute",
-                            top: "-50px",
-                            right: 0,
-                            width: "44px",
-                            height: "44px",
-                            borderRadius: "50%",
-                            border: "none",
-                            background: "rgba(255,255,255,0.2)",
-                            color: "#ffffff",
-                            cursor: "pointer",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center"
-                        }}
-                    >
-                        <X size={24} />
-                    </button>
-                    <img
-                        src={`http://localhost:3030${selectedUser.profilePhoto}`}
-                        alt={selectedUser.username}
-                        style={{
-                            maxWidth: "100%",
-                            maxHeight: "90vh",
-                            borderRadius: "8px",
-                            boxShadow: "0 8px 32px rgba(0,0,0,0.5)"
-                        }}
-                    />
-                </div>
-            </div>
-        );
-    };
-
-    return (
-        <div
 }
 
 export default App;
