@@ -2,6 +2,8 @@
 import { useState } from "react";
 import axios from "axios";
 import { Link, useNavigate } from "react-router-dom";
+import { signInWithEmailAndPassword } from "firebase/auth";
+import { auth, authReady } from "./firebase";
 
 function Login() {
     const [email, setEmail] = useState("");
@@ -24,20 +26,36 @@ function Login() {
         try {
             setLoading(true);
 
-            const response = await axios.post(
+            await authReady;
+            const credential = await signInWithEmailAndPassword(auth, email.trim(), password);
+            if (!credential.user.emailVerified) {
+                throw new Error("Please verify your email address before signing in.");
+            }
+            const token = await credential.user.getIdToken();
+            await axios.post(
                 "http://localhost:3030/login",
+                {},
                 {
-                    email: email.trim(),
-                    password
+                    headers: { Authorization: `Bearer ${token}` },
+                    useProvidedAuthToken: true
                 }
             );
 
-            sessionStorage.setItem("token", response.data.token);
+            if (auth.currentUser?.uid !== credential.user.uid) {
+                setError("The signed-in account changed. Please sign in again.");
+                return;
+            }
+
             navigate("/chat");
         } catch (error) {
+            if (error.code === "auth/user-not-found" || error.code === "auth/invalid-credential" || error.code === "auth/wrong-password") {
+                setError("Invalid email or password.");
+                return;
+            }
             setError(
                 error.response?.data?.message ||
                 error.response?.data?.error ||
+                error.message ||
                 "Login failed. Please check your credentials and try again."
             );
         } finally {

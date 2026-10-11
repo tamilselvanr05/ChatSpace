@@ -109,7 +109,6 @@ function Settings() {
     }, []);
 
     const logout = () => {
-        sessionStorage.removeItem("token");
         socket.disconnect();
         signOut(auth);
         navigate("/");
@@ -145,7 +144,6 @@ function Settings() {
 
             const response = await axios.delete("http://localhost:3030/account");
             window.alert(response.data.message || "Your account has been deleted.");
-            sessionStorage.removeItem("token");
             socket.disconnect();
             await signOut(auth);
             navigate("/");

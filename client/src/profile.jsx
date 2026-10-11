@@ -18,22 +18,12 @@ function Profile() {
         fetchProfile();
     }, []);
 
-    const fetchProfile = async () => {
+    async function fetchProfile() {
 
         try {
-
-            const token =
-                sessionStorage.getItem("token");
-
             const response =
                 await axios.get(
-                    "http://localhost:3030/profile",
-                    {
-                        headers: {
-                            Authorization:
-                                `Bearer ${token}`
-                        }
-                    }
+                    "http://localhost:3030/profile"
                 );
 
             const profile =
@@ -63,7 +53,7 @@ function Profile() {
 
         }
 
-    };
+    }
 
     const handlePhotoChange = async (e) => {
 
@@ -100,10 +90,6 @@ function Profile() {
         }
 
         try {
-
-            const token =
-                sessionStorage.getItem("token");
-
             const formData =
                 new FormData();
 
@@ -115,13 +101,7 @@ function Profile() {
             const response =
                 await axios.put(
                     "http://localhost:3030/profile/photo",
-                    formData,
-                    {
-                        headers: {
-                            Authorization:
-                                `Bearer ${token}`
-                        }
-                    }
+                    formData
                 );
 
             setProfilePhoto(
@@ -146,10 +126,6 @@ function Profile() {
     const updateProfile = async () => {
 
         try {
-
-            const token =
-                sessionStorage.getItem("token");
-
             await axios.put(
                 "http://localhost:3030/profile",
                 {
@@ -157,12 +133,6 @@ function Profile() {
                         newUsername,
                     about:
                         about
-                },
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${token}`
-                    }
                 }
             );
 

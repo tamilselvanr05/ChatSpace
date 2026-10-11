@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
-import { signOut } from "firebase/auth";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
+import GroupEvents from "./components/GroupEvents";
 import {
     ArrowLeft,
     ChevronRight,
@@ -22,8 +23,11 @@ import {
     UsersRound,
     Video,
     X,
-    Info
+    Info,
+    AlertTriangle
 } from "lucide-react";
+import { detectSuspiciousMessage } from "./utils/scamDetector";
+import { splitMessageLinks } from "./utils/linkifyMessage";
 
 
 
@@ -99,6 +103,11 @@ function App() {
     const [isRecording, setIsRecording] = useState(false);
     const [mediaRecorder, setMediaRecorder] = useState(null);
     const [openMenu, setOpenMenu] = useState(null);
+    const [openWarningId, setOpenWarningId] = useState(null);
+    const [reportDraft, setReportDraft] = useState(null);
+    const [reportReason, setReportReason] = useState("suspected_scam");
+    const [reportDetails, setReportDetails] = useState("");
+    const [reportStatus, setReportStatus] = useState({});
     const [showCreateGroup, setShowCreateGroup] = useState(false);
     const [newGroupName, setNewGroupName] = useState("");
     const [newGroupMembers, setNewGroupMembers] = useState([]);
@@ -118,6 +127,7 @@ function App() {
     const peerConnectionRef = useRef(null);
     const localStreamRef = useRef(null);
     const pendingIceCandidatesRef = useRef([]);
+    const authRequestVersionRef = useRef(0);
 
     useEffect(() => {
         document.documentElement.dataset.theme = theme;
@@ -362,14 +372,6 @@ useEffect(() => {
     ];
 
     useEffect(() => {
-        const token = sessionStorage.getItem("token");
-
-        if (!token) {
-            socket.disconnect();
-            window.location.href = "/";
-            return;
-        }
-
         let disposed = false;
 
         const handleConnect = () => {
@@ -382,7 +384,6 @@ useEffect(() => {
             }
 
             if (["AUTH_REQUIRED", "AUTH_INVALID"].includes(error.data?.code)) {
-                sessionStorage.removeItem("token");
                 socket.disconnect();
                 signOut(auth);
                 window.location.href = "/";
@@ -395,52 +396,82 @@ useEffect(() => {
         socket.on("connect", handleConnect);
         socket.on("connect_error", handleConnectError);
 
-        const authenticateAndConnect = async () => {
+        const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+            const requestVersion = ++authRequestVersionRef.current;
+            socket.disconnect();
+            setUserId("");
+            setProfileUser(null);
+            setUsers([]);
+            setBlockedUserIds([]);
+            setGroups([]);
+            setSelectedGroup(null);
+            setSelectedUser(null);
+            setMessages([]);
+            setReplyingTo(null);
+            setUnreadCounts({});
+            setLastMessages({});
+            setMessageNotification(null);
+            setIncomingCall(null);
+            peerConnectionRef.current?.close();
+            peerConnectionRef.current = null;
+            pendingIceCandidatesRef.current = [];
+            localStreamRef.current?.getTracks().forEach((track) => track.stop());
+            localStreamRef.current = null;
+            setLocalStream(null);
+            setRemoteStream(null);
+            setCallState(null);
+
+            if (!firebaseUser) {
+                if (!disposed) navigate("/");
+                return;
+            }
+
             try {
-                const response = await axios.get(
-                    "http://localhost:3030/profile",
-                    {
-                        headers: {
-                            Authorization: `Bearer ${token}`
-                        }
-                    }
-                );
-                const authenticatedUserId = response.data.user?._id;
+                if (
+                    disposed ||
+                    requestVersion !== authRequestVersionRef.current ||
+                    auth.currentUser?.uid !== firebaseUser.uid
+                ) return;
 
-                if (!authenticatedUserId) {
-                    throw new Error("Authenticated profile has no user ID");
-                }
+                const response = await axios.get("http://localhost:3030/profile");
+                if (
+                    disposed ||
+                    requestVersion !== authRequestVersionRef.current ||
+                    auth.currentUser?.uid !== firebaseUser.uid
+                ) return;
 
-                if (disposed) {
-                    return;
-                }
-
-                setUserId(authenticatedUserId);
+                const authenticatedUser = response.data.user;
+                if (!authenticatedUser?._id) throw new Error("Authenticated profile has no user ID");
+                setUserId(authenticatedUser._id);
+                setProfileUser(authenticatedUser);
                 socket.connect();
             } catch (error) {
-                if (disposed) {
-                    return;
-                }
-
-                console.log("Token error:", error);
-
+                if (disposed || requestVersion !== authRequestVersionRef.current) return;
                 if (error.response?.status === 401 || error.response?.status === 404) {
-                    sessionStorage.removeItem("token");
                     socket.disconnect();
-                    signOut(auth);
-                    window.location.href = "/";
+                    await signOut(auth);
+                    navigate("/");
+                } else {
+                    console.error("Authenticated profile could not be loaded:", error.message);
                 }
             }
-        };
-
-        authenticateAndConnect();
+        }, (error) => {
+            socket.disconnect();
+            if (!disposed) {
+                console.error("Firebase authentication initialization failed:", error.code || "unknown");
+                navigate("/");
+            }
+        });
 
         return () => {
             disposed = true;
+            authRequestVersionRef.current += 1;
+            unsubscribeAuth();
+            socket.disconnect();
             socket.off("connect", handleConnect);
             socket.off("connect_error", handleConnectError);
         };
-    }, []);
+    }, [navigate]);
 
     useEffect(() => {
         const handleCallOffer = (data) => {
@@ -567,24 +598,13 @@ useEffect(() => {
     }, [userId, callState, incomingCall, closeCall]);
 
     useEffect(() => {
+        if (!userId) return undefined;
+        let active = true;
+        const firebaseUid = auth.currentUser?.uid;
         const getUsers = async () => {
             try {
-                const token =
-                    sessionStorage.getItem("token");
-
-                const response = await axios.get(
-                    "http://localhost:3030/users",
-                    {
-                        headers: {
-                            Authorization:
-                                `Bearer ${token}`
-                        }
-                    }
-                );
-
-                setUsers(
-                    response.data.users
-                );
+                const response = await axios.get("http://localhost:3030/users");
+                if (active && auth.currentUser?.uid === firebaseUid) setUsers(response.data.users);
 
             } catch (error) {
                 console.log(
@@ -629,32 +649,22 @@ useEffect(() => {
         );
 
         return () => {
+            active = false;
             socket.off(
                 "userStatusChanged",
                 handleStatusChange
             );
         };
-    }, []);
+    }, [userId]);
 
     useEffect(() => {
+        if (!userId) return undefined;
+        let active = true;
+        const firebaseUid = auth.currentUser?.uid;
         const getGroups = async () => {
             try {
-                const token =
-                    sessionStorage.getItem("token");
-
-                const response = await axios.get(
-                    "http://localhost:3030/groups",
-                    {
-                        headers: {
-                            Authorization:
-                                `Bearer ${token}`
-                        }
-                    }
-                );
-
-                setGroups(
-                    response.data.groups
-                );
+                const response = await axios.get("http://localhost:3030/groups");
+                if (active && auth.currentUser?.uid === firebaseUid) setGroups(response.data.groups);
 
             } catch (error) {
                 console.log(
@@ -665,17 +675,22 @@ useEffect(() => {
         };
 
         getGroups();
-    }, []);
+        return () => { active = false; };
+    }, [userId]);
 
     useEffect(() => {
+        if (!userId) return undefined;
+        let active = true;
+        const firebaseUid = auth.currentUser?.uid;
         axios.get("http://localhost:3030/blocked-users")
             .then((response) => {
-                setBlockedUserIds(response.data.users.map((user) => user._id.toString()));
+                if (active && auth.currentUser?.uid === firebaseUid) setBlockedUserIds(response.data.users.map((user) => user._id.toString()));
             })
             .catch((error) => {
-                console.log(error.response?.data || error.message);
+                if (active) console.log(error.response?.data || error.message);
             });
-    }, []);
+        return () => { active = false; };
+    }, [userId]);
 
     useEffect(() => {
         const handleConversationRemoved = (data) => {
@@ -701,33 +716,6 @@ useEffect(() => {
             socket.off("conversationRestored", handleConversationRestored);
         };
     }, [selectedUser]);
-
-    useEffect(() => {
-        const getProfile = async () => {
-            try {
-                const token =
-                    sessionStorage.getItem("token");
-
-                const response = await axios.get(
-                    "http://localhost:3030/profile",
-                    {
-                        headers: {
-                            Authorization: `Bearer ${token}`
-                        }
-                    }
-                );
-
-                setProfileUser(response.data.user);
-            } catch (error) {
-                console.log(
-                    error.response?.data ||
-                    error.message
-                );
-            }
-        };
-
-        getProfile();
-    }, []);
 
     useEffect(() => {
         const handleReceiveMessage = (data) => {
@@ -1053,17 +1041,8 @@ if (
         setOpenMenu(null);
 
         try {
-            const token =
-                sessionStorage.getItem("token");
-
             const response = await axios.get(
-                `http://localhost:3030/messages/${user._id}`,
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${token}`
-                    }
-                }
+                `http://localhost:3030/messages/${user._id}`
             );
 
             const loadedMessages =
@@ -1144,17 +1123,8 @@ if (
         setOpenMenu(null);
 
         try {
-            const token =
-                sessionStorage.getItem("token");
-
             const response = await axios.get(
-                `http://localhost:3030/groups/${group._id}/messages`,
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${token}`
-                    }
-                }
+                `http://localhost:3030/groups/${group._id}/messages`
             );
 
             const loadedMessages =
@@ -1180,19 +1150,10 @@ if (
         }
 
         try {
-            const token =
-                sessionStorage.getItem("token");
-
             const response = await axios.put(
                 `http://localhost:3030/groups/${selectedGroup._id}/members`,
                 {
                     members: selectedMembers
-                },
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${token}`
-                    }
                 }
             );
 
@@ -1238,19 +1199,11 @@ if (
         }
 
         try {
-            const token =
-                sessionStorage.getItem("token");
-
             const response = await axios.post(
                 "http://localhost:3030/groups",
                 {
                     name: groupName,
                     members: newGroupMembers
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`
-                    }
                 }
             );
 
@@ -1505,19 +1458,13 @@ if (
 
         try {
 
-            const token = sessionStorage.getItem("token");
             const formData = new FormData();
 
             formData.append("file", file);
 
             const response = await axios.post(
                 "http://localhost:3030/upload",
-                formData,
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`
-                    }
-                }
+                formData
             );
 
             const uploadedFile = response.data.file;
@@ -1626,15 +1573,9 @@ if (
                 formData.append("file", audioBlob, fileName);
 
                 try {
-                    const token = sessionStorage.getItem("token");
                     const response = await axios.post(
                         "http://localhost:3030/upload",
-                        formData,
-                        {
-                            headers: {
-                                Authorization: `Bearer ${token}`
-                            }
-                        }
+                        formData
                     );
 
                     const uploadedFile = response.data.file;
@@ -1855,7 +1796,24 @@ if (
         msg.senderId?.toString() ===
         userId?.toString();
 
+    const submitMessageReport = async () => {
+        if (!reportDraft || !window.confirm("Submit this message report? Your report is private and will not be shown to the sender.")) return;
+        setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: true, message: "" } }));
+        try {
+            await axios.post(`http://localhost:3030/messages/${reportDraft._id}/report`, {
+                reason: reportReason,
+                details: reportDetails
+            });
+            setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: false, success: true, message: "Report submitted." } }));
+            setReportDraft(null);
+            setReportDetails("");
+        } catch (error) {
+            setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: false, message: error.response?.data?.message || "Report could not be submitted. Try again." } }));
+        }
+    };
+
     return (
+        <>
         <div
             className="cs-app"
             data-theme={theme}
@@ -2150,7 +2108,6 @@ if (
                                             if (callState) {
                                                 closeCall(true);
                                             }
-                                            sessionStorage.removeItem("token");
                                             socket.disconnect();
                                             signOut(auth);
                                             navigate("/");
@@ -3046,6 +3003,9 @@ if (
                                     isOwnMessage(
                                         msg
                                     );
+                                const warning = msg.messageType === "text"
+                                    ? detectSuspiciousMessage(msg.message)
+                                    : null;
 
                                 return (
                                     <div
@@ -3168,7 +3128,11 @@ if (
                                                             wordBreak:
                                                                 "break-word",
                                                             lineHeight:
-                                                                "1.4"
+                                                                "1.4",
+                                                            whiteSpace:
+                                                                msg.messageType === "text"
+                                                                    ? "pre-wrap"
+                                                                    : undefined
                                                         }}
                                                     >
                                                             {msg.messageType === "audio" && msg.fileUrl ? (
@@ -3270,7 +3234,17 @@ if (
                                                                     </div>
                                                                 </div>
                                                             ) : (
-                                                                msg.message
+                                                                splitMessageLinks(msg.message).map((part, index) => part.href ? (
+                                                                    <a
+                                                                        key={`${msg._id}-link-${index}`}
+                                                                        href={part.href}
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                        style={{ overflowWrap: "anywhere" }}
+                                                                    >
+                                                                        {part.text}
+                                                                    </a>
+                                                                ) : part.text)
                                                             )}
                                                     </div>
 
@@ -3307,6 +3281,39 @@ if (
                                                         ⋮
                                                     </button>
                                                 </div>
+
+                                                {warning && (
+                                                    <div className="cs-scam-warning">
+                                                        <button
+                                                            type="button"
+                                                            className="cs-scam-warning-toggle"
+                                                            aria-expanded={openWarningId === msg._id}
+                                                            onClick={() => setOpenWarningId(openWarningId === msg._id ? null : msg._id)}
+                                                        >
+                                                            <AlertTriangle size={14} />
+                                                            <span>{warning.risk} risk pattern detected</span>
+                                                        </button>
+                                                        {openWarningId === msg._id && (
+                                                            <div className="cs-scam-warning-detail">
+                                                                <strong>Why this warning appeared</strong>
+                                                                <ul>{warning.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                                                                <p>This rule-based warning can make mistakes and cannot determine whether a message is safe or fraudulent.</p>
+                                                                {reportStatus[msg._id]?.success ? (
+                                                                    <div className="cs-report-success" role="status">{reportStatus[msg._id].message}</div>
+                                                                ) : (
+                                                                    <>
+                                                                        {reportStatus[msg._id]?.message && <div className="cs-report-error" role="alert">{reportStatus[msg._id].message}</div>}
+                                                                        <button type="button" className="cs-report-button" onClick={() => {
+                                                                            setReportDraft(msg);
+                                                                            setReportReason("suspected_scam");
+                                                                            setReportDetails("");
+                                                                        }}>Report message</button>
+                                                                    </>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
 
                                                 <div
                                                     style={{
@@ -4063,6 +4070,7 @@ if (
                 </div>
             ))}
         </section>
+        <GroupEvents group={selectedGroup} userId={userId} />
     </>
 ) : selectedUser ? (
     <>
@@ -4845,6 +4853,35 @@ if (
                 </div>
             )}
         </div>
+        {reportDraft && (
+            <div className="cs-report-backdrop" role="presentation" onMouseDown={(event) => {
+                if (event.target === event.currentTarget) setReportDraft(null);
+            }}>
+                <section className="cs-report-dialog" role="dialog" aria-modal="true" aria-labelledby="cs-report-title">
+                    <button type="button" className="cs-report-close" aria-label="Close report dialog" onClick={() => setReportDraft(null)}><X size={18} /></button>
+                    <h2 id="cs-report-title">Report message</h2>
+                    <p>Choose the closest reason. Your identity is not shared with the message sender.</p>
+                    <label htmlFor="cs-report-reason">Reason</label>
+                    <select id="cs-report-reason" value={reportReason} onChange={(event) => setReportReason(event.target.value)}>
+                        <option value="suspected_scam">Suspected scam</option>
+                        <option value="credential_request">Password or code request</option>
+                        <option value="suspicious_link">Suspicious link</option>
+                        <option value="spam">Spam</option>
+                        <option value="other">Other</option>
+                    </select>
+                    <label htmlFor="cs-report-details">Optional details</label>
+                    <textarea id="cs-report-details" maxLength={500} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} placeholder="Add context (up to 500 characters)" />
+                    <div className="cs-report-dialog-actions">
+                        <button type="button" onClick={() => setReportDraft(null)}>Keep message</button>
+                        <button type="button" disabled={Boolean(reportStatus[reportDraft._id]?.loading)} onClick={submitMessageReport}>
+                            {reportStatus[reportDraft._id]?.loading ? "Submitting…" : "Confirm report"}
+                        </button>
+                    </div>
+                    {reportStatus[reportDraft._id]?.message && <div className="cs-report-error" role="alert">{reportStatus[reportDraft._id].message}</div>}
+                </section>
+            </div>
+        )}
+        </>
     );
 }
 

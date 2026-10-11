@@ -5,10 +5,58 @@ require("dotenv").config();
 const bcrypt = require("bcrypt");
 const User = require("./models/user");
 const Message = require("./models/message");
+const MessageReport = require("./models/messageReport");
 const Group = require("./models/group");
+const GroupEvent = require("./models/groupEvent");
+const GroupEventRsvp = require("./models/groupEventRsvp");
 const authMiddleware = require("./middleware/authMiddleware");
 const { resolveFirebaseUser } = require("./firebaseIdentity");
 const firebaseAdminAuth = require("./firebaseAdmin");
+
+const messageReportAttempts = new Map();
+
+function consumeMessageReportLimit(userId) {
+    const now = Date.now();
+    const windowStart = now - 10 * 60 * 1000;
+    const recentAttempts = (messageReportAttempts.get(userId) || []).filter((time) => time > windowStart);
+    if (recentAttempts.length >= 5) {
+        messageReportAttempts.set(userId, recentAttempts);
+        return false;
+    }
+    recentAttempts.push(now);
+    messageReportAttempts.set(userId, recentAttempts);
+    for (const [id, attempts] of messageReportAttempts) {
+        if (!attempts.some((time) => time > windowStart)) messageReportAttempts.delete(id);
+    }
+    return true;
+}
+
+async function getGroupEventDetails(eventId) {
+    const event = await GroupEvent.findById(eventId).lean();
+    if (!event) return null;
+    const rsvps = await GroupEventRsvp.find({ eventId }).populate("userId", "username").lean();
+    const attendees = { going: [], notGoing: [], maybe: [] };
+    for (const rsvp of rsvps) {
+        if (rsvp.userId) attendees[rsvp.response].push({ userId: rsvp.userId._id, username: rsvp.userId.username });
+    }
+    return { ...event, attendees };
+}
+
+async function broadcastGroupEvent(groupId, eventId, change) {
+    const group = await Group.findById(groupId).select("members");
+    if (!group) return;
+    const event = await getGroupEventDetails(eventId);
+    if (!event) return;
+    for (const memberId of group.members) {
+        io.to(memberId.toString()).emit("groupEvent:updated", { groupId: groupId.toString(), change, event });
+    }
+}
+
+function parseEventDate(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
 
 // Socket.IO imports
 const http = require("http");
@@ -93,6 +141,41 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+
+app.post("/messages/:messageId/report", authMiddleware, async (req, res) => {
+    const { messageId } = req.params;
+    const reason = req.body?.reason;
+    const details = req.body?.details == null ? "" : req.body.details;
+    const allowedReasons = ["suspected_scam", "credential_request", "suspicious_link", "spam", "other"];
+    if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ message: "Invalid message ID" });
+    if (!allowedReasons.includes(reason) || typeof details !== "string" || details.trim().length > 500) {
+        return res.status(400).json({ message: "Choose a valid report reason and keep details within 500 characters" });
+    }
+    try {
+        const reporterId = req.user.userId;
+        const message = await Message.findOne({ _id: messageId, deletedFor: { $ne: reporterId } }).select("senderId receiverId groupId").lean();
+        if (!message) return res.status(404).json({ message: "Message not found" });
+        let canAccess = false;
+        if (message.groupId) {
+            canAccess = Boolean(await Group.exists({ _id: message.groupId, members: reporterId }));
+        } else {
+            canAccess = message.senderId.toString() === reporterId || message.receiverId?.toString() === reporterId;
+        }
+        if (!canAccess) return res.status(404).json({ message: "Message not found" });
+        if (await MessageReport.exists({ reporterId, messageId })) {
+            return res.status(409).json({ message: "You have already reported this message" });
+        }
+        if (!consumeMessageReportLimit(reporterId)) {
+            return res.status(429).json({ message: "Report limit reached. Try again later." });
+        }
+        await MessageReport.create({ reporterId, messageId, reason, details: details.trim() });
+        return res.status(201).json({ message: "Report submitted" });
+    } catch (error) {
+        if (error.code === 11000) return res.status(409).json({ message: "You have already reported this message" });
+        console.error("Submit message report error:", error.code || "unknown");
+        return res.status(500).json({ message: "Report could not be submitted" });
+    }
+});
 
 io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
@@ -273,6 +356,128 @@ app.get("/groups", authMiddleware, async (req, res) => {
 
     }
 
+});
+
+// Group events are always scoped to a group the verified user currently belongs to.
+app.get("/groups/:groupId/events", authMiddleware, async (req, res) => {
+    const { groupId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(groupId)) return res.status(400).json({ message: "Invalid group ID" });
+    try {
+        const group = await Group.findOne({ _id: groupId, members: req.user.userId }).select("_id");
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        const events = await GroupEvent.find({ groupId }).sort({ startsAt: 1 }).lean();
+        const detailedEvents = await Promise.all(events.map((event) => getGroupEventDetails(event._id)));
+        return res.json({ events: detailedEvents });
+    } catch (error) {
+        console.error("Get group events error:", error);
+        return res.status(500).json({ message: "Events could not be loaded" });
+    }
+});
+
+app.post("/groups/:groupId/events", authMiddleware, async (req, res) => {
+    const { groupId } = req.params;
+    const body = req.body;
+    if (!mongoose.Types.ObjectId.isValid(groupId)) return res.status(400).json({ message: "Invalid group ID" });
+    if (!body || typeof body !== "object" || Array.isArray(body)) return res.status(400).json({ message: "Invalid event details" });
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const description = body.description == null ? "" : typeof body.description === "string" ? body.description.trim() : null;
+    const location = body.location == null ? "" : typeof body.location === "string" ? body.location.trim() : null;
+    const startsAt = parseEventDate(body.startsAt);
+    if (!title || title.length > 120 || description === null || description.length > 2000 || location === null || location.length > 200 || !startsAt) {
+        return res.status(400).json({ message: "Enter a title, valid date and time, and values within the field limits" });
+    }
+    try {
+        const [group, user] = await Promise.all([
+            Group.findOne({ _id: groupId, members: req.user.userId }).select("_id"),
+            User.findOne({ _id: req.user.userId, isDeleting: { $ne: true }, isDeleted: { $ne: true } }).select("_id")
+        ]);
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        if (!user) return res.status(403).json({ message: "Account is unavailable" });
+        const event = await GroupEvent.create({ groupId, createdBy: user._id, title, description, location, startsAt });
+        const detailed = await getGroupEventDetails(event._id);
+        await broadcastGroupEvent(groupId, event._id, "created");
+        return res.status(201).json({ event: detailed });
+    } catch (error) {
+        console.error("Create group event error:", error);
+        return res.status(500).json({ message: "Event could not be created" });
+    }
+});
+
+app.put("/groups/:groupId/events/:eventId", authMiddleware, async (req, res) => {
+    const { groupId, eventId } = req.params;
+    if (![groupId, eventId].every(mongoose.Types.ObjectId.isValid)) return res.status(400).json({ message: "Invalid group or event ID" });
+    const body = req.body;
+    const title = typeof body?.title === "string" ? body.title.trim() : "";
+    const description = body?.description == null ? "" : typeof body.description === "string" ? body.description.trim() : null;
+    const location = body?.location == null ? "" : typeof body.location === "string" ? body.location.trim() : null;
+    const startsAt = parseEventDate(body?.startsAt);
+    if (!title || title.length > 120 || description === null || description.length > 2000 || location === null || location.length > 200 || !startsAt) {
+        return res.status(400).json({ message: "Enter a title, valid date and time, and values within the field limits" });
+    }
+    try {
+        const group = await Group.findOne({ _id: groupId, members: req.user.userId }).select("_id");
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        const event = await GroupEvent.findOneAndUpdate(
+            { _id: eventId, groupId, createdBy: req.user.userId, cancelled: false },
+            { $set: { title, description, location, startsAt } },
+            { new: true, runValidators: true }
+        );
+        if (!event) return res.status(403).json({ message: "Only the event creator can edit this event" });
+        await broadcastGroupEvent(groupId, eventId, "updated");
+        return res.json({ event: await getGroupEventDetails(eventId) });
+    } catch (error) {
+        console.error("Update group event error:", error);
+        return res.status(500).json({ message: "Event could not be updated" });
+    }
+});
+
+app.post("/groups/:groupId/events/:eventId/cancel", authMiddleware, async (req, res) => {
+    const { groupId, eventId } = req.params;
+    if (![groupId, eventId].every(mongoose.Types.ObjectId.isValid)) return res.status(400).json({ message: "Invalid group or event ID" });
+    try {
+        const group = await Group.findOne({ _id: groupId, members: req.user.userId }).select("_id");
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        const event = await GroupEvent.findOneAndUpdate(
+            { _id: eventId, groupId, createdBy: req.user.userId, cancelled: false },
+            { $set: { cancelled: true } }, { new: true }
+        );
+        if (!event) return res.status(403).json({ message: "Only the event creator can cancel this event" });
+        await broadcastGroupEvent(groupId, eventId, "cancelled");
+        return res.json({ event: await getGroupEventDetails(eventId) });
+    } catch (error) {
+        console.error("Cancel group event error:", error);
+        return res.status(500).json({ message: "Event could not be cancelled" });
+    }
+});
+
+app.put("/groups/:groupId/events/:eventId/rsvp", authMiddleware, async (req, res) => {
+    const { groupId, eventId } = req.params;
+    const response = req.body?.response;
+    if (![groupId, eventId].every(mongoose.Types.ObjectId.isValid)) return res.status(400).json({ message: "Invalid group or event ID" });
+    if (!["going", "notGoing", "maybe"].includes(response)) return res.status(400).json({ message: "Choose a valid RSVP response" });
+    try {
+        const group = await Group.findOne({ _id: groupId, members: req.user.userId }).select("_id");
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        const event = await GroupEvent.findOne({ _id: eventId, groupId, cancelled: false }).select("_id");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+        await GroupEventRsvp.findOneAndUpdate(
+            { eventId, userId: req.user.userId },
+            { $set: { response } },
+            { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
+        );
+        await broadcastGroupEvent(groupId, eventId, "rsvp");
+        return res.json({ event: await getGroupEventDetails(eventId) });
+    } catch (error) {
+        if (error.code === 11000) {
+            try {
+                await GroupEventRsvp.updateOne({ eventId, userId: req.user.userId }, { $set: { response } });
+                await broadcastGroupEvent(groupId, eventId, "rsvp");
+                return res.json({ event: await getGroupEventDetails(eventId) });
+            } catch { /* report below */ }
+        }
+        console.error("Update group event RSVP error:", error);
+        return res.status(500).json({ message: "RSVP could not be saved" });
+    }
 });
 
 app.put("/groups/:groupId/members", authMiddleware, async (req, res) => {
@@ -753,6 +958,7 @@ io.on("connection", (socket) => {
             if (!deletedMessage) {
                 return;
             }
+            await MessageReport.deleteMany({ messageId: message._id });
 
             const recipients = group
                 ? group.members.map((memberId) => memberId.toString())
@@ -1308,6 +1514,7 @@ app.delete("/account", authMiddleware, async (req, res) => {
             { "replyTo.senderName": account.username },
             { $set: { "replyTo.senderName": "Deleted user" } }
         );
+        await MessageReport.deleteMany({ reporterId: userId });
 
         if (account.profilePhoto?.startsWith("/uploads/")) {
             const photoPath = path.resolve(uploadFolder, path.basename(account.profilePhoto));

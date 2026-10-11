@@ -1,5 +1,8 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { createUserWithEmailAndPassword, sendEmailVerification, signOut, updateProfile } from "firebase/auth";
+import axios from "axios";
+import { auth, authReady } from "./firebase";
 
 function Signup() {
     const navigate = useNavigate();
@@ -41,33 +44,50 @@ function Signup() {
         try {
             setLoading(true);
 
-            const response = await fetch("http://localhost:3030/signup", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    username: form.username.trim(),
-                    email: form.email.trim(),
-                    password: form.password
-                })
+            await authReady;
+            const username = form.username.trim();
+            const availability = await axios.post("http://localhost:3030/username-availability", {
+                username
             });
-
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(
-                    data.message || data.error || "Signup failed."
-                );
+            if (!availability.data.available) {
+                setError("Username already exists. Please choose another username.");
+                return;
             }
 
-            alert("Account created successfully! Please log in.");
+            const credential = await createUserWithEmailAndPassword(auth, form.email.trim(), form.password);
+            await updateProfile(credential.user, { displayName: username });
+            const token = await credential.user.getIdToken(true);
+            await axios.post("http://localhost:3030/signup", {}, {
+                headers: { Authorization: `Bearer ${token}` },
+                useProvidedAuthToken: true
+            });
+            await sendEmailVerification(credential.user);
+            if (auth.currentUser?.uid === credential.user.uid) await signOut(auth);
+            alert("Account created. Verify your email before signing in.");
             navigate("/");
         } catch (err) {
+            if (err.code === "auth/email-already-in-use") {
+                setError("A Firebase account already exists for this email. Sign in with that account to link it to ChatSpace.");
+                return;
+            }
+            if (err.response?.data?.code === "EMAIL_NOT_VERIFIED") {
+                try {
+                    const currentUser = auth.currentUser;
+                    if (currentUser) await sendEmailVerification(currentUser);
+                    await signOut(auth);
+                    alert("Account created. Verify your email before signing in.");
+                    navigate("/");
+                    return;
+                } catch (verificationError) {
+                    setError(verificationError.message || "Could not send the verification email.");
+                    return;
+                }
+            }
             setError(
-                err.message === "Failed to fetch"
+                err.response?.data?.message ||
+                (err.message === "Failed to fetch"
                     ? "Cannot connect to the server. Please check whether your backend is running."
-                    : err.message
+                    : err.message)
             );
         } finally {
             setLoading(false);
