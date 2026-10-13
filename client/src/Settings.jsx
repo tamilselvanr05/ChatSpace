@@ -14,6 +14,7 @@ import { useNavigate } from "react-router-dom";
 import socket from "./socket";
 import { EmailAuthProvider, reauthenticateWithCredential, signOut } from "firebase/auth";
 import { auth } from "./firebase";
+import { apiUrl } from "./config";
 
 const settingsSections = [
     {
@@ -100,10 +101,10 @@ function Settings() {
     const [deletingAccount, setDeletingAccount] = useState(false);
 
     useEffect(() => {
-        axios.get("http://localhost:3030/blocked-users")
+        axios.get(apiUrl("/blocked-users"))
             .then((response) => setBlockedUsers(response.data.users || []))
             .catch(() => {});
-        axios.get("http://localhost:3030/account/deletion-status")
+        axios.get(apiUrl("/account/deletion-status"))
             .then((response) => setAccountDeletionPending(Boolean(response.data.pending)))
             .catch(() => {});
     }, []);
@@ -116,7 +117,7 @@ function Settings() {
 
     const unblockUser = async (user) => {
         try {
-            await axios.delete(`http://localhost:3030/users/${user._id}/block`);
+            await axios.delete(apiUrl(`/users/${user._id}/block`));
             setBlockedUsers((previous) => previous.filter((blockedUser) => blockedUser._id !== user._id));
         } catch (error) {
             setAccountActionError(error.response?.data?.message || "User could not be unblocked.");
@@ -142,7 +143,7 @@ function Settings() {
                 await currentUser.getIdToken(true);
             }
 
-            const response = await axios.delete("http://localhost:3030/account");
+            const response = await axios.delete(apiUrl("/account"));
             window.alert(response.data.message || "Your account has been deleted.");
             socket.disconnect();
             await signOut(auth);

@@ -1,4 +1,4 @@
-const User = require("./models/user");
+const User = require("./models/User");
 const firebaseAuth = require("./firebaseAdmin");
 
 const normalizeEmail = (email) => email.trim().toLowerCase();

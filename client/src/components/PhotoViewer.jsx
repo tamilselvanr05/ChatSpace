@@ -1,0 +1,139 @@
+import { useEffect, useRef } from "react";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { getWrappedImageIndex } from "../utils/photoNavigation";
+import { ProtectedImage } from "./ProtectedMedia";
+
+function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
+    const closeButtonRef = useRef(null);
+    const previousButtonRef = useRef(null);
+    const nextButtonRef = useRef(null);
+    const closeRef = useRef(onClose);
+    const navigateRef = useRef(onNavigate);
+    const navigationRef = useRef({ activeIndex, length: images.length });
+    const image = images[activeIndex];
+    const isOpen = Boolean(image);
+
+    useEffect(() => {
+        closeRef.current = onClose;
+        navigateRef.current = onNavigate;
+        navigationRef.current = { activeIndex, length: images.length };
+    }, [activeIndex, images.length, onClose, onNavigate]);
+
+    useEffect(() => {
+        if (!isOpen) return undefined;
+
+        const previousFocus = document.activeElement;
+        const previousOverflow = document.body.style.overflow;
+        document.body.style.overflow = "hidden";
+        closeButtonRef.current?.focus();
+
+        const handleKeyDown = (event) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeRef.current();
+            } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                event.preventDefault();
+                const direction = event.key === "ArrowRight" ? 1 : -1;
+                const nextIndex = getWrappedImageIndex(
+                    navigationRef.current.activeIndex,
+                    direction,
+                    navigationRef.current.length
+                );
+                if (nextIndex >= 0) navigateRef.current(nextIndex);
+            } else if (event.key === "Tab") {
+                const buttons = [
+                    closeButtonRef.current,
+                    previousButtonRef.current,
+                    nextButtonRef.current
+                ].filter((button) => button && !button.disabled);
+                if (!buttons.length) return;
+                const first = buttons[0];
+                const last = buttons[buttons.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown);
+            document.body.style.overflow = previousOverflow;
+            if (previousFocus?.isConnected) previousFocus.focus();
+        };
+    }, [isOpen]);
+
+    if (!image) return null;
+
+    const multipleImages = images.length > 1;
+    const navigate = (direction) => {
+        const nextIndex = getWrappedImageIndex(activeIndex, direction, images.length);
+        if (nextIndex >= 0) onNavigate(nextIndex);
+    };
+
+    return (
+        <div
+            className="cs-photo-viewer-backdrop"
+            role="presentation"
+            onClick={(event) => {
+                if (event.target === event.currentTarget) onClose();
+            }}
+        >
+            <section className="cs-photo-viewer" role="dialog" aria-modal="true" aria-label="Photo viewer">
+                <button
+                    ref={closeButtonRef}
+                    type="button"
+                    className="cs-photo-viewer-close"
+                    aria-label="Close photo viewer"
+                    onClick={onClose}
+                >
+                    <X size={24} />
+                </button>
+                {multipleImages && (
+                    <>
+                        <button
+                            ref={previousButtonRef}
+                            type="button"
+                            className="cs-photo-viewer-nav is-previous"
+                            aria-label="Previous photo"
+                            onClick={() => navigate(-1)}
+                        >
+                            <ChevronLeft size={28} />
+                        </button>
+                        <button
+                            ref={nextButtonRef}
+                            type="button"
+                            className="cs-photo-viewer-nav is-next"
+                            aria-label="Next photo"
+                            onClick={() => navigate(1)}
+                        >
+                            <ChevronRight size={28} />
+                        </button>
+                    </>
+                )}
+                <div className="cs-photo-viewer-content" onClick={(event) => event.stopPropagation()}>
+                    <ProtectedImage
+                        key={image._id}
+                        path={`/media/messages/${image._id}`}
+                        alt={image.fileName || "Shared photo"}
+                        className="cs-photo-viewer-error"
+                        loadingLabel="Loading photo…"
+                        fallback="This photo could not be loaded."
+                    />
+                    {multipleImages && (
+                        <span className="cs-photo-viewer-count" aria-live="polite">
+                            {activeIndex + 1} / {images.length}
+                        </span>
+                    )}
+                    {image.fileName && <span className="cs-photo-viewer-caption">{image.fileName}</span>}
+                </div>
+            </section>
+        </div>
+    );
+}
+
+export default PhotoViewer;

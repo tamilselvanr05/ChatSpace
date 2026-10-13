@@ -4,6 +4,8 @@ import axios from "axios";
 import { Link, useNavigate } from "react-router-dom";
 import { signInWithEmailAndPassword } from "firebase/auth";
 import { auth, authReady } from "./firebase";
+import { apiUrl } from "./config";
+import ChatSpaceLogo from "./components/ChatSpaceLogo";
 
 function Login() {
     const [email, setEmail] = useState("");
@@ -33,7 +35,7 @@ function Login() {
             }
             const token = await credential.user.getIdToken();
             await axios.post(
-                "http://localhost:3030/login",
+                apiUrl("/login"),
                 {},
                 {
                     headers: { Authorization: `Bearer ${token}` },
@@ -65,58 +67,9 @@ function Login() {
 
     return (
         <main className="auth-page">
-            <section className="auth-showcase">
-                <Link to="/login" className="brand">
-                    <span className="brand-icon">C</span>
-                    <span>Chat<span className="brand-highlight">space</span></span>
-                </Link>
-
-                <div className="showcase-content">
-                    <span className="eyebrow">YOUR SPACE TO CONNECT</span>
-                    <h1>Conversations that bring people closer.</h1>
-                    <p>
-                        Your people, your groups, your moments.
-                        Everything you need to stay connected in one place.
-                    </p>
-
-                    <div className="feature-list">
-                        <div className="feature-item">
-                            <span>✦</span>
-                            <div>
-                                <strong>Private conversations</strong>
-                                <p>Chat one-to-one in real time.</p>
-                            </div>
-                        </div>
-
-                        <div className="feature-item">
-                            <span>◈</span>
-                            <div>
-                                <strong>Groups that feel connected</strong>
-                                <p>Bring your people together.</p>
-                            </div>
-                        </div>
-
-                        <div className="feature-item">
-                            <span>♫</span>
-                            <div>
-                                <strong>More than messages</strong>
-                                <p>Share files, images and voice messages.</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <p className="showcase-footer">
-                    A little closer, wherever you are.
-                </p>
-            </section>
-
             <section className="auth-form-side">
                 <div className="auth-card">
-                    <div className="mobile-brand brand">
-                        <span className="brand-icon">C</span>
-                        <span>Chat<span className="brand-highlight">space</span></span>
-                    </div>
+                    <ChatSpaceLogo className="auth-logo" />
 
                     <div className="auth-heading">
                         <span className="eyebrow">WELCOME BACK</span>
@@ -171,19 +124,19 @@ function Login() {
                             className="auth-submit"
                             disabled={loading}
                         >
-                            {loading ? "Signing in..." : "Sign in to Chatspace"}
+                            {loading ? "Signing in..." : "Sign in to ChatSpace"}
                             {!loading && <span>→</span>}
                         </button>
                     </form>
 
                     <p className="auth-switch">
-                        New to Chatspace?
+                        New to ChatSpace?
                         {" "}
                         <Link to="/signup">Create an account</Link>
                     </p>
 
                     <p className="auth-legal">
-                        By continuing, you agree to use Chatspace responsibly.
+                        By continuing, you agree to use ChatSpace responsibly.
                     </p>
                 </div>
             </section>

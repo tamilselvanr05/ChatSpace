@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import axios from "axios";
 import {
     ArrowLeft,
     Bell,
@@ -10,6 +11,7 @@ import {
     Volume2
 } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { apiUrl } from "./config";
 
 function SettingsDetail() {
     const navigate = useNavigate();
@@ -34,6 +36,28 @@ function SettingsDetail() {
     const [messageStyle, setMessageStyle] = useState(
         localStorage.getItem("chatspace_message_style") || "rounded"
     );
+    const [messageFont, setMessageFont] = useState(
+        localStorage.getItem("chatspace_message_font") || "default"
+    );
+    const [readReceiptsEnabled, setReadReceiptsEnabled] = useState(true);
+    const [readReceiptLoading, setReadReceiptLoading] = useState(true);
+    const [readReceiptError, setReadReceiptError] = useState("");
+
+    useEffect(() => {
+        if (location.pathname !== "/privacy") return;
+        let active = true;
+        axios.get(apiUrl("/preferences/read-receipts"))
+            .then((response) => {
+                if (active) setReadReceiptsEnabled(response.data.enabled !== false);
+            })
+            .catch((error) => {
+                if (active) setReadReceiptError(error.response?.data?.message || "Read receipt settings could not be loaded.");
+            })
+            .finally(() => {
+                if (active) setReadReceiptLoading(false);
+            });
+        return () => { active = false; };
+    }, [location.pathname]);
 
     const pageData = {
         "/privacy": {
@@ -135,6 +159,25 @@ function SettingsDetail() {
         );
     };
 
+    const saveMessageFont = (value) => {
+        setMessageFont(value);
+        localStorage.setItem("chatspace_message_font", value);
+        window.dispatchEvent(new Event("chatspace-settings-change"));
+    };
+
+    const saveReadReceipts = async (value) => {
+        setReadReceiptError("");
+        setReadReceiptLoading(true);
+        try {
+            const response = await axios.patch(apiUrl("/preferences/read-receipts"), { enabled: value });
+            setReadReceiptsEnabled(response.data.enabled !== false);
+        } catch (error) {
+            setReadReceiptError(error.response?.data?.message || "Read receipt settings could not be saved.");
+        } finally {
+            setReadReceiptLoading(false);
+        }
+    };
+
     return (
         <main className="cs-settings-page">
             <div className="cs-settings-shell">
@@ -206,10 +249,12 @@ function SettingsDetail() {
 
                         <SettingToggle
                             title="Read receipts"
-                            description="Allow others to know when you have read their messages."
-                            checked={true}
-                            disabled={true}
+                            description="Allow other members to see when you have read their messages. Delivery ticks are unchanged."
+                            checked={readReceiptsEnabled}
+                            disabled={readReceiptLoading}
+                            onChange={saveReadReceipts}
                         />
+                        {readReceiptError && <p role="alert" className="cs-settings-error">{readReceiptError}</p>}
 
                         <SettingToggle
                             title="Typing indicator"
@@ -258,13 +303,14 @@ function SettingsDetail() {
                 )}
 
                 {location.pathname === "/chat-background" && (
-                    <div className="cs-settings-card">
+                    <div className="cs-settings-card cs-wallpaper-grid">
 
                         <BackgroundOption
                             label="Default"
                             value="default"
                             selected={background}
                             onClick={saveBackground}
+                            preview
                         />
 
                         <BackgroundOption
@@ -272,6 +318,7 @@ function SettingsDetail() {
                             value="soft"
                             selected={background}
                             onClick={saveBackground}
+                            preview
                         />
 
                         <BackgroundOption
@@ -279,6 +326,7 @@ function SettingsDetail() {
                             value="midnight"
                             selected={background}
                             onClick={saveBackground}
+                            preview
                         />
 
                         <BackgroundOption
@@ -286,36 +334,32 @@ function SettingsDetail() {
                             value="lavender"
                             selected={background}
                             onClick={saveBackground}
+                            preview
                         />
 
                     </div>
                 )}
 
                 {location.pathname === "/message-style" && (
-                    <div className="cs-settings-card">
-
-                        <BackgroundOption
-                            label="Rounded"
-                            value="rounded"
-                            selected={messageStyle}
-                            onClick={saveMessageStyle}
-                        />
-
-                        <BackgroundOption
-                            label="Compact"
-                            value="compact"
-                            selected={messageStyle}
-                            onClick={saveMessageStyle}
-                        />
-
-                        <BackgroundOption
-                            label="Modern"
-                            value="modern"
-                            selected={messageStyle}
-                            onClick={saveMessageStyle}
-                        />
-
-                    </div>
+                    <>
+                        <div className="cs-appearance-section">
+                            <h2>Message style</h2>
+                            <div className="cs-appearance-options">
+                                <AppearanceOption label="Rounded" value="rounded" selected={messageStyle} onClick={saveMessageStyle} />
+                                <AppearanceOption label="Compact" value="compact" selected={messageStyle} onClick={saveMessageStyle} />
+                                <AppearanceOption label="Modern" value="modern" selected={messageStyle} onClick={saveMessageStyle} />
+                            </div>
+                        </div>
+                        <div className="cs-appearance-section">
+                            <h2>Chat font</h2>
+                            <div className="cs-appearance-options">
+                                <AppearanceOption label="Default" value="default" selected={messageFont} onClick={saveMessageFont} />
+                                <AppearanceOption label="Clean" value="clean" selected={messageFont} onClick={saveMessageFont} />
+                                <AppearanceOption label="Serif" value="serif" selected={messageFont} onClick={saveMessageFont} />
+                                <AppearanceOption label="Monospace" value="monospace" selected={messageFont} onClick={saveMessageFont} />
+                            </div>
+                        </div>
+                    </>
                 )}
 
                 {location.pathname === "/notifications" && (
@@ -448,42 +492,19 @@ function SettingToggle({
                 </small>
             </div>
 
-            <button
-                type="button"
-                disabled={disabled}
-                onClick={() =>
-                    onChange && onChange(!checked)
-                }
-                style={{
-                    width: "48px",
-                    height: "27px",
-                    border: "none",
-                    borderRadius: "20px",
-                    background: checked
-                        ? "#ef6b4f"
-                        : "#d7d7d7",
-                    position: "relative",
-                    cursor: disabled
-                        ? "default"
-                        : "pointer",
-                    opacity: disabled ? 0.7 : 1
-                }}
-            >
-                <span
-                    style={{
-                        position: "absolute",
-                        top: "4px",
-                        left: checked
-                            ? "25px"
-                            : "4px",
-                        width: "19px",
-                        height: "19px",
-                        borderRadius: "50%",
-                        background: "#ffffff",
-                        transition: "0.2s"
-                    }}
-                />
-            </button>
+            <div className="cs-toggle-control">
+                <button
+                    type="button"
+                    className="cs-toggle"
+                    disabled={disabled}
+                    aria-label={`${title}: ${checked ? "On" : "Off"}`}
+                    aria-pressed={checked}
+                    onClick={() => onChange && onChange(!checked)}
+                >
+                    <span className="cs-toggle-knob" />
+                </button>
+                <span className="cs-toggle-state">{checked ? "On" : "Off"}</span>
+            </div>
 
         </div>
     );
@@ -493,21 +514,49 @@ function BackgroundOption({
     label,
     value,
     selected,
-    onClick
+    onClick,
+    preview = false
 }) {
     return (
         <button
             type="button"
             onClick={() => onClick(value)}
-            className="cs-detail-option"
+            className={`cs-detail-option${preview ? " cs-wallpaper-option" : ""}`}
+            aria-pressed={selected === value}
         >
-            <span>
-                {label}
-            </span>
-
-            {selected === value && (
-                <Check size={18} />
+            {preview && (
+                <span className="cs-wallpaper-preview" data-wallpaper-preview={value} aria-hidden="true">
+                    <span />
+                    <span />
+                </span>
             )}
+            {preview ? (
+                <span className="cs-wallpaper-option-label">
+                    {label}
+                    {selected === value && <Check size={18} aria-hidden="true" />}
+                </span>
+            ) : (
+                <span>{label}</span>
+            )}
+
+            {!preview && selected === value && (
+                <Check size={18} aria-hidden="true" />
+            )}
+        </button>
+    );
+}
+
+function AppearanceOption({ label, value, selected, onClick }) {
+    return (
+        <button type="button" className="cs-appearance-option" aria-pressed={selected === value} onClick={() => onClick(value)}>
+            <span className={`cs-appearance-preview is-${value}`} aria-hidden="true">
+                <span />
+                <span>Chat message</span>
+            </span>
+            <span className="cs-wallpaper-option-label">
+                {label}
+                {selected === value && <Check size={18} aria-hidden="true" />}
+            </span>
         </button>
     );
 }

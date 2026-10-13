@@ -3,9 +3,14 @@ import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import { onAuthStateChanged, signOut } from "firebase/auth";
 import { auth } from "./firebase";
+import { apiUrl } from "./config";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
+import CallHistoryEntry from "./components/CallHistoryEntry";
+import PhotoViewer from "./components/PhotoViewer";
+import { ProtectedAudio, ProtectedDownload, ProtectedImage } from "./components/ProtectedMedia";
 import GroupEvents from "./components/GroupEvents";
+import ChatSpaceLogo from "./components/ChatSpaceLogo";
 import {
     ArrowLeft,
     ChevronRight,
@@ -17,8 +22,8 @@ import {
     LockKeyhole,
     Search,
     Send,
+    Square,
     Settings,
-    Smile,
     UserRound,
     UsersRound,
     Video,
@@ -87,11 +92,21 @@ function App() {
     const [showAddMembers, setShowAddMembers] = useState(false);
     const [selectedMembers, setSelectedMembers] = useState([]);
     const [memberSearch, setMemberSearch] = useState("");
+    const [addingMembers, setAddingMembers] = useState(false);
+    const [addMembersError, setAddMembersError] = useState("");
+    const [addMembersNotice, setAddMembersNotice] = useState("");
+    const [memberDirectoryLoading, setMemberDirectoryLoading] = useState(true);
+    const [memberDirectoryError, setMemberDirectoryError] = useState("");
     const [selectedUser, setSelectedUser] = useState(null);
     const [messages, setMessages] = useState([]);
+    const [callHistory, setCallHistory] = useState([]);
+    const [photoViewerMessageId, setPhotoViewerMessageId] = useState(null);
     const [message, setMessage] = useState("");
+    const [messageSendError, setMessageSendError] = useState("");
     const [replyingTo, setReplyingTo] = useState(null);
     const [isTyping, setIsTyping] = useState(false);
+    const [groupTypingUsers, setGroupTypingUsers] = useState({});
+    const [sidebarTyping, setSidebarTyping] = useState({});
     const [search, setSearch] = useState("");
     const [unreadCounts, setUnreadCounts] = useState({});
     const [lastMessages, setLastMessages] = useState({});
@@ -102,6 +117,9 @@ function App() {
     const [showAttachment, setShowAttachment] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
     const [mediaRecorder, setMediaRecorder] = useState(null);
+    const [recordingSeconds, setRecordingSeconds] = useState(0);
+    const [voicePreview, setVoicePreview] = useState(null);
+    const [voiceSending, setVoiceSending] = useState(false);
     const [openMenu, setOpenMenu] = useState(null);
     const [openWarningId, setOpenWarningId] = useState(null);
     const [reportDraft, setReportDraft] = useState(null);
@@ -117,6 +135,15 @@ function App() {
     const [theme] = useState(
         () => localStorage.getItem("chatspace-theme") || "ocean"
     );
+    const [chatBackground] = useState(
+        () => localStorage.getItem("chatspace_background") || "default"
+    );
+    const [messageStyle] = useState(
+        () => localStorage.getItem("chatspace_message_style") || "rounded"
+    );
+    const [messageFont] = useState(
+        () => localStorage.getItem("chatspace_message_font") || "default"
+    );
     const [callState, setCallState] = useState(null);
     const [incomingCall, setIncomingCall] = useState(null);
     const [localStream, setLocalStream] = useState(null);
@@ -127,7 +154,51 @@ function App() {
     const peerConnectionRef = useRef(null);
     const localStreamRef = useRef(null);
     const pendingIceCandidatesRef = useRef([]);
+    const pendingLocalIceCandidatesRef = useRef([]);
+    const currentCallIdRef = useRef(null);
+    const callGenerationRef = useRef(0);
+    const callConnectionTimerRef = useRef(null);
     const authRequestVersionRef = useRef(0);
+    const typingStateRef = useRef({ key: null, isTyping: false });
+    const typingTimersRef = useRef(new Map());
+    const typingHeartbeatRef = useRef(null);
+    const typingStopTimeoutRef = useRef(null);
+    const activeTypingKeyRef = useRef(null);
+    const recordingStartedAtRef = useRef(0);
+    const voicePreviewRef = useRef(null);
+    const mediaRecorderRef = useRef(null);
+    const discardRecordingRef = useRef(false);
+
+    useEffect(() => {
+        activeTypingKeyRef.current = selectedGroup
+            ? `group:${selectedGroup._id}`
+            : selectedUser
+                ? `private:${selectedUser._id}`
+                : null;
+    }, [selectedGroup, selectedUser]);
+
+    useEffect(() => {
+        if (!isRecording) return undefined;
+        const timer = window.setInterval(() => {
+            setRecordingSeconds(Math.floor((Date.now() - recordingStartedAtRef.current) / 1000));
+        }, 250);
+        return () => window.clearInterval(timer);
+    }, [isRecording]);
+
+    useEffect(() => {
+        voicePreviewRef.current = voicePreview;
+    }, [voicePreview]);
+
+    useEffect(() => () => {
+        discardRecordingRef.current = true;
+        if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+        mediaRecorderRef.current?.stream?.getTracks().forEach((track) => track.stop());
+        if (voicePreviewRef.current?.url) URL.revokeObjectURL(voicePreviewRef.current.url);
+        typingTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+        typingTimersRef.current.clear();
+        window.clearInterval(typingHeartbeatRef.current);
+        window.clearTimeout(typingStopTimeoutRef.current);
+    }, []);
 
     useEffect(() => {
         document.documentElement.dataset.theme = theme;
@@ -176,17 +247,23 @@ useEffect(() => {
         const peerId =
             callState?.peerId ||
             incomingCall?.from;
+        const callId = callState?.callId || incomingCall?.callId || currentCallIdRef.current;
 
-        if (notifyPeer && peerId) {
+        if (notifyPeer && peerId && callId) {
             socket.emit("call:end", {
                 from: userId,
-                to: peerId
+                to: peerId,
+                callId
             });
         }
 
+        callGenerationRef.current += 1;
+        clearTimeout(callConnectionTimerRef.current);
+        callConnectionTimerRef.current = null;
         peerConnectionRef.current?.close();
         peerConnectionRef.current = null;
         pendingIceCandidatesRef.current = [];
+        pendingLocalIceCandidatesRef.current = [];
         localStreamRef.current?.getTracks().forEach((track) => {
             track.stop();
         });
@@ -195,9 +272,10 @@ useEffect(() => {
         setRemoteStream(null);
         setIncomingCall(null);
         setCallState(null);
+        currentCallIdRef.current = null;
     }, [callState, incomingCall, userId]);
 
-    const createPeerConnection = (peerId) => {
+    const createPeerConnection = (peerId, callId = null) => {
         const peerConnection = new RTCPeerConnection({
             iceServers: [
                 {
@@ -210,9 +288,15 @@ useEffect(() => {
 
         peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
+                const activeCallId = callId || currentCallIdRef.current;
+                if (!activeCallId) {
+                    pendingLocalIceCandidatesRef.current.push(event.candidate);
+                    return;
+                }
                 socket.emit("call:ice-candidate", {
                     from: userId,
                     to: peerId,
+                    callId: activeCallId,
                     candidate: event.candidate
                 });
             }
@@ -224,11 +308,29 @@ useEffect(() => {
 
         peerConnection.onconnectionstatechange = () => {
             if (peerConnection.connectionState === "connected") {
+                clearTimeout(callConnectionTimerRef.current);
+                callConnectionTimerRef.current = null;
                 setCallState((previousCall) =>
                     previousCall
                         ? { ...previousCall, status: "active" }
                         : previousCall
                 );
+                const activeCallId = callId || currentCallIdRef.current;
+                if (activeCallId) {
+                    socket.emit("call:connected", { to: peerId, callId: activeCallId });
+                }
+            } else if (peerConnection.connectionState === "failed") {
+                const activeCallId = callId || currentCallIdRef.current;
+                if (activeCallId) socket.emit("call:end", { to: peerId, callId: activeCallId });
+                closeCall(false);
+            } else if (peerConnection.connectionState === "disconnected") {
+                clearTimeout(callConnectionTimerRef.current);
+                callConnectionTimerRef.current = setTimeout(() => {
+                    if (peerConnection.connectionState !== "disconnected") return;
+                    const activeCallId = callId || currentCallIdRef.current;
+                    if (activeCallId) socket.emit("call:end", { to: peerId, callId: activeCallId });
+                    closeCall(false);
+                }, 10000);
             }
         };
 
@@ -251,6 +353,8 @@ useEffect(() => {
             return;
         }
 
+        const callGeneration = ++callGenerationRef.current;
+        currentCallIdRef.current = null;
         setCallError("");
         setCallState({
             status: "calling",
@@ -264,6 +368,11 @@ useEffect(() => {
                 audio: true,
                 video: callType === "video"
             });
+
+            if (callGeneration !== callGenerationRef.current) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
 
             localStreamRef.current = stream;
             setLocalStream(stream);
@@ -279,6 +388,8 @@ useEffect(() => {
             const offer = await peerConnection.createOffer();
             await peerConnection.setLocalDescription(offer);
 
+            if (callGeneration !== callGenerationRef.current) return;
+
             socket.emit("call:offer", {
                 from: userId,
                 to: selectedUser._id,
@@ -288,6 +399,7 @@ useEffect(() => {
             });
 
         } catch (error) {
+            if (callGeneration !== callGenerationRef.current) return;
             console.error("Could not start call:", error);
             setCallError(
                 "Microphone or camera permission is required to call."
@@ -302,6 +414,8 @@ useEffect(() => {
         }
 
         const call = incomingCall;
+        const callGeneration = ++callGenerationRef.current;
+        currentCallIdRef.current = call.callId;
         setCallError("");
         setCallState({
             status: "connecting",
@@ -316,13 +430,19 @@ useEffect(() => {
                 video: call.callType === "video"
             });
 
+            if (callGeneration !== callGenerationRef.current) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
+
             localStreamRef.current = stream;
             setLocalStream(stream);
 
-            const peerConnection = createPeerConnection(call.from);
+            const peerConnection = createPeerConnection(call.from, call.callId);
             await peerConnection.setRemoteDescription(
                 new RTCSessionDescription(call.offer)
             );
+            if (callGeneration !== callGenerationRef.current) return;
             await addPendingIceCandidates(peerConnection);
 
             stream.getTracks().forEach((track) => {
@@ -331,23 +451,27 @@ useEffect(() => {
 
             const answer = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answer);
+            if (callGeneration !== callGenerationRef.current) return;
 
             socket.emit("call:answer", {
                 from: userId,
                 to: call.from,
+                callId: call.callId,
                 answer: peerConnection.localDescription
             });
 
             setIncomingCall(null);
 
         } catch (error) {
+            if (callGeneration !== callGenerationRef.current) return;
             console.error("Could not accept call:", error);
             setCallError(
                 "Microphone or camera permission is required to answer."
             );
             socket.emit("call:reject", {
                 from: userId,
-                to: call.from
+                to: call.from,
+                callId: call.callId
             });
             closeCall(false);
         }
@@ -357,7 +481,8 @@ useEffect(() => {
         if (incomingCall) {
             socket.emit("call:reject", {
                 from: userId,
-                to: incomingCall.from
+                to: incomingCall.from,
+                callId: incomingCall.callId
             });
         }
 
@@ -399,6 +524,19 @@ useEffect(() => {
         const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
             const requestVersion = ++authRequestVersionRef.current;
             socket.disconnect();
+            typingStateRef.current = { key: null, payload: null, isTyping: false };
+            window.clearInterval(typingHeartbeatRef.current);
+            window.clearTimeout(typingStopTimeoutRef.current);
+            typingHeartbeatRef.current = null;
+            typingStopTimeoutRef.current = null;
+            typingTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+            typingTimersRef.current.clear();
+            setSidebarTyping({});
+            setGroupTypingUsers({});
+            setIsTyping(false);
+            if (voicePreviewRef.current?.url) URL.revokeObjectURL(voicePreviewRef.current.url);
+            voicePreviewRef.current = null;
+            setVoicePreview(null);
             setUserId("");
             setProfileUser(null);
             setUsers([]);
@@ -417,6 +555,11 @@ useEffect(() => {
             pendingIceCandidatesRef.current = [];
             localStreamRef.current?.getTracks().forEach((track) => track.stop());
             localStreamRef.current = null;
+            callGenerationRef.current += 1;
+            clearTimeout(callConnectionTimerRef.current);
+            callConnectionTimerRef.current = null;
+            pendingLocalIceCandidatesRef.current = [];
+            currentCallIdRef.current = null;
             setLocalStream(null);
             setRemoteStream(null);
             setCallState(null);
@@ -433,7 +576,7 @@ useEffect(() => {
                     auth.currentUser?.uid !== firebaseUser.uid
                 ) return;
 
-                const response = await axios.get("http://localhost:3030/profile");
+                const response = await axios.get(apiUrl("/profile"));
                 if (
                     disposed ||
                     requestVersion !== authRequestVersionRef.current ||
@@ -474,20 +617,49 @@ useEffect(() => {
     }, [navigate]);
 
     useEffect(() => {
+        const handleCallCreated = (data) => {
+            if (
+                callState?.status !== "calling" ||
+                callState?.peerId?.toString() !== data.peerId?.toString()
+            ) {
+                if (!callState && !incomingCall) {
+                    socket.emit("call:end", { to: data.peerId, callId: data.callId });
+                }
+                return;
+            }
+            currentCallIdRef.current = data.callId;
+            for (const candidate of pendingLocalIceCandidatesRef.current) {
+                socket.emit("call:ice-candidate", {
+                    to: data.peerId,
+                    callId: data.callId,
+                    candidate
+                });
+            }
+            pendingLocalIceCandidatesRef.current = [];
+            setCallState((previousCall) =>
+                previousCall?.peerId?.toString() === data.peerId?.toString()
+                    ? { ...previousCall, callId: data.callId }
+                    : previousCall
+            );
+        };
+
         const handleCallOffer = (data) => {
             if (callState || incomingCall) {
                 socket.emit("call:busy", {
                     from: userId,
-                    to: data.from
+                    to: data.from,
+                    callId: data.callId
                 });
                 return;
             }
 
+            currentCallIdRef.current = data.callId;
             pendingIceCandidatesRef.current = [];
             setIncomingCall(data);
             setCallState({
                 status: "incoming",
                 callType: data.callType,
+                callId: data.callId,
                 peerId: data.from,
                 peerName: data.fromName
             });
@@ -498,7 +670,8 @@ useEffect(() => {
 
             if (
                 !peerConnection ||
-                callState?.peerId?.toString() !== data.from?.toString()
+                callState?.peerId?.toString() !== data.from?.toString() ||
+                callState?.callId !== data.callId
             ) {
                 return;
             }
@@ -526,7 +699,8 @@ useEffect(() => {
 
             if (
                 expectedPeer?.toString() !==
-                data.from?.toString()
+                data.from?.toString() ||
+                (data.callId && currentCallIdRef.current && data.callId !== currentCallIdRef.current)
             ) {
                 return;
             }
@@ -552,7 +726,8 @@ useEffect(() => {
         const handleCallReject = (data) => {
             if (
                 callState?.peerId?.toString() ===
-                data.from?.toString()
+                    data.from?.toString() &&
+                callState?.callId === data.callId
             ) {
                 setCallError("The call was declined.");
                 closeCall(false);
@@ -562,7 +737,8 @@ useEffect(() => {
         const handleCallBusy = (data) => {
             if (
                 callState?.peerId?.toString() ===
-                data.from?.toString()
+                    data.from?.toString() &&
+                callState?.callId === data.callId
             ) {
                 setCallError("This person is on another call.");
                 closeCall(false);
@@ -576,10 +752,12 @@ useEffect(() => {
                 incomingCall?.from?.toString() ===
                     data.from?.toString()
             ) {
+                if ((callState?.callId || incomingCall?.callId) !== data.callId) return;
                 closeCall(false);
             }
         };
 
+        socket.on("call:created", handleCallCreated);
         socket.on("call:offer", handleCallOffer);
         socket.on("call:answer", handleCallAnswer);
         socket.on("call:ice-candidate", handleCallIceCandidate);
@@ -588,6 +766,7 @@ useEffect(() => {
         socket.on("call:end", handleCallEnd);
 
         return () => {
+            socket.off("call:created", handleCallCreated);
             socket.off("call:offer", handleCallOffer);
             socket.off("call:answer", handleCallAnswer);
             socket.off("call:ice-candidate", handleCallIceCandidate);
@@ -598,19 +777,68 @@ useEffect(() => {
     }, [userId, callState, incomingCall, closeCall]);
 
     useEffect(() => {
+        const selectedPeerId = selectedUser?._id?.toString();
+        if (!userId || !selectedPeerId) {
+            setCallHistory([]);
+            return undefined;
+        }
+
+        let active = true;
+        setCallHistory([]);
+
+        const mergeCall = (call) => {
+            if (!active || !call) return;
+            const callerId = call.callerId?.toString();
+            const calleeId = call.calleeId?.toString();
+            if (![callerId, calleeId].includes(userId.toString()) ||
+                ![callerId, calleeId].includes(selectedPeerId)) return;
+
+            setCallHistory((previousCalls) => {
+                const existing = previousCalls.find((item) => item.callId === call.callId);
+                const incomingUpdatedAt = new Date(call.updatedAt || call.createdAt || 0).getTime();
+                const existingUpdatedAt = new Date(existing?.updatedAt || existing?.createdAt || 0).getTime();
+                const latestCall = existing && existingUpdatedAt > incomingUpdatedAt ? existing : call;
+                return [
+                    ...previousCalls.filter((item) => item.callId !== call.callId),
+                    latestCall
+                ].sort((first, second) => new Date(first.initiatedAt) - new Date(second.initiatedAt));
+            });
+        };
+
+        const handleCallHistoryUpdated = (event) => mergeCall(event.call);
+        socket.on("callHistory:updated", handleCallHistoryUpdated);
+
+        axios.get(apiUrl(`/users/${selectedPeerId}/calls`))
+            .then((response) => {
+                if (!active) return;
+                response.data.calls.forEach(mergeCall);
+            })
+            .catch((error) => {
+                if (active) console.error("Call history could not be loaded:", error.response?.data?.message || error.message);
+            });
+
+        return () => {
+            active = false;
+            socket.off("callHistory:updated", handleCallHistoryUpdated);
+        };
+    }, [selectedUser?._id, userId]);
+
+    useEffect(() => {
         if (!userId) return undefined;
         let active = true;
         const firebaseUid = auth.currentUser?.uid;
         const getUsers = async () => {
             try {
-                const response = await axios.get("http://localhost:3030/users");
-                if (active && auth.currentUser?.uid === firebaseUid) setUsers(response.data.users);
+                const response = await axios.get(apiUrl("/users"));
+                if (active && auth.currentUser?.uid === firebaseUid) {
+                    setUsers(response.data.users);
+                    setMemberDirectoryError("");
+                }
 
             } catch (error) {
-                console.log(
-                    error.response?.data ||
-                    error.message
-                );
+                if (active) setMemberDirectoryError(error.response?.data?.message || "People could not be loaded.");
+            } finally {
+                if (active) setMemberDirectoryLoading(false);
             }
         };
 
@@ -641,6 +869,14 @@ useEffect(() => {
 
                 return previousUser;
             });
+            const updateGroupMembers = (group) => ({
+                ...group,
+                members: group.members.map((member) => member._id?.toString() === data.userId?.toString()
+                    ? { ...member, isOnline: data.isOnline }
+                    : member)
+            });
+            setGroups((previousGroups) => previousGroups.map(updateGroupMembers));
+            setSelectedGroup((previousGroup) => previousGroup ? updateGroupMembers(previousGroup) : previousGroup);
         };
 
         socket.on(
@@ -663,7 +899,7 @@ useEffect(() => {
         const firebaseUid = auth.currentUser?.uid;
         const getGroups = async () => {
             try {
-                const response = await axios.get("http://localhost:3030/groups");
+                const response = await axios.get(apiUrl("/groups"));
                 if (active && auth.currentUser?.uid === firebaseUid) setGroups(response.data.groups);
 
             } catch (error) {
@@ -682,7 +918,7 @@ useEffect(() => {
         if (!userId) return undefined;
         let active = true;
         const firebaseUid = auth.currentUser?.uid;
-        axios.get("http://localhost:3030/blocked-users")
+        axios.get(apiUrl("/blocked-users"))
             .then((response) => {
                 if (active && auth.currentUser?.uid === firebaseUid) setBlockedUserIds(response.data.users.map((user) => user._id.toString()));
             })
@@ -703,7 +939,7 @@ useEffect(() => {
         };
         const handleConversationRestored = async () => {
             try {
-                const response = await axios.get("http://localhost:3030/users");
+                const response = await axios.get(apiUrl("/users"));
                 setUsers(response.data.users);
             } catch (error) {
                 console.log(error.response?.data || error.message);
@@ -716,6 +952,23 @@ useEffect(() => {
             socket.off("conversationRestored", handleConversationRestored);
         };
     }, [selectedUser]);
+
+    useEffect(() => {
+        const handleGroupMembersUpdated = (group) => {
+            if (!group?._id) return;
+            setGroups((previousGroups) => {
+                const alreadyListed = previousGroups.some((item) => item._id?.toString() === group._id.toString());
+                return alreadyListed
+                    ? previousGroups.map((item) => item._id?.toString() === group._id.toString() ? group : item)
+                    : [...previousGroups, group];
+            });
+            setSelectedGroup((previousGroup) =>
+                previousGroup?._id?.toString() === group._id.toString() ? group : previousGroup
+            );
+        };
+        socket.on("groupMembersUpdated", handleGroupMembersUpdated);
+        return () => socket.off("groupMembersUpdated", handleGroupMembersUpdated);
+    }, []);
 
     useEffect(() => {
         const handleReceiveMessage = (data) => {
@@ -887,13 +1140,74 @@ if (
 
     useEffect(() => {
         const handleUserTyping = (data) => {
-            if (
-                selectedUser &&
-                data.senderId === selectedUser._id
-            ) {
-                setIsTyping(
-                    data.isTyping
-                );
+            const isGroupEvent = Boolean(data.groupId);
+            if (data.senderId?.toString() === userId?.toString()) return;
+
+            const conversationKey = isGroupEvent
+                ? `group:${data.groupId}`
+                : `private:${data.senderId}`;
+            const timerKey = `${conversationKey}:${data.senderId}`;
+            const existingTimer = typingTimersRef.current.get(timerKey);
+            if (existingTimer) window.clearTimeout(existingTimer);
+
+            setSidebarTyping((previous) => {
+                const next = { ...previous };
+                if (isGroupEvent) {
+                    const groupTypers = { ...(next[conversationKey] || {}) };
+                    if (data.isTyping) groupTypers[data.senderId] = data.username || "A member";
+                    else delete groupTypers[data.senderId];
+                    if (Object.keys(groupTypers).length) next[conversationKey] = groupTypers;
+                    else delete next[conversationKey];
+                } else if (data.isTyping) {
+                    next[conversationKey] = true;
+                } else {
+                    delete next[conversationKey];
+                }
+                return next;
+            });
+
+            const isActiveConversation = activeTypingKeyRef.current === conversationKey;
+            if (isActiveConversation && isGroupEvent) {
+                setGroupTypingUsers((previous) => {
+                    const next = { ...previous };
+                    if (data.isTyping) next[data.senderId] = data.username || "A member";
+                    else delete next[data.senderId];
+                    return next;
+                });
+            } else if (isActiveConversation) {
+                setIsTyping(Boolean(data.isTyping));
+            }
+
+            if (data.isTyping) {
+                const timer = window.setTimeout(() => {
+                    setSidebarTyping((previous) => {
+                        const next = { ...previous };
+                        if (isGroupEvent) {
+                            const groupTypers = { ...(next[conversationKey] || {}) };
+                            delete groupTypers[data.senderId];
+                            if (Object.keys(groupTypers).length) next[conversationKey] = groupTypers;
+                            else delete next[conversationKey];
+                        } else {
+                            delete next[conversationKey];
+                        }
+                        return next;
+                    });
+                    if (activeTypingKeyRef.current === conversationKey) {
+                    if (isGroupEvent) {
+                        setGroupTypingUsers((previous) => {
+                            const next = { ...previous };
+                            delete next[data.senderId];
+                            return next;
+                        });
+                    } else {
+                        setIsTyping(false);
+                    }
+                    }
+                    typingTimersRef.current.delete(timerKey);
+                }, 4000);
+                typingTimersRef.current.set(timerKey, timer);
+            } else {
+                typingTimersRef.current.delete(timerKey);
             }
         };
 
@@ -908,7 +1222,7 @@ if (
                 handleUserTyping
             );
         };
-    }, [selectedUser]);
+    }, [selectedUser, selectedGroup, userId]);
 
     useEffect(() => {
         const handleMessageDeleted = (data) => {
@@ -1025,6 +1339,7 @@ if (
     }, [messages]);
 
     const selectUser = async (user) => {
+        clearTypingForCurrentChat();
         setSelectedUser(user);
         setSelectedGroup(null);
         setUnreadCounts((previousCounts) => ({
@@ -1032,6 +1347,8 @@ if (
             [user._id]: 0
         }));
         setMessages([]);
+        setCallHistory([]);
+        setPhotoViewerMessageId(null);
         setMessageSearch("");
         setShowMessageSearch(false);
         setReplyingTo(null);
@@ -1042,7 +1359,7 @@ if (
 
         try {
             const response = await axios.get(
-                `http://localhost:3030/messages/${user._id}`
+                apiUrl(`/messages/${user._id}`)
             );
 
             const loadedMessages =
@@ -1062,6 +1379,7 @@ if (
     const isSelectedUserBlocked = Boolean(
         selectedUser && blockedUserIds.includes(selectedUser._id.toString())
     );
+    const isSelfChat = Boolean(selectedUser && selectedUser._id?.toString() === userId?.toString());
 
     const setSelectedUserBlocked = async (shouldBlock) => {
         if (!selectedUser) return;
@@ -1070,7 +1388,7 @@ if (
         }
 
         try {
-            const url = `http://localhost:3030/users/${selectedUser._id}/block`;
+            const url = apiUrl(`/users/${selectedUser._id}/block`);
             if (shouldBlock) {
                 await axios.post(url);
                 setBlockedUserIds((ids) => ids.includes(selectedUser._id.toString()) ? ids : [...ids, selectedUser._id.toString()]);
@@ -1089,7 +1407,7 @@ if (
         }
 
         try {
-            await axios.delete(`http://localhost:3030/conversations/${selectedUser._id}`);
+            await axios.delete(apiUrl(`/conversations/${selectedUser._id}`));
             setMessages([]);
             setUsers((previous) => previous.filter((user) => user._id !== selectedUser._id));
             setSelectedUser(null);
@@ -1111,9 +1429,12 @@ if (
     };
 
     const selectGroup = async (group) => {
+        clearTypingForCurrentChat();
         setSelectedGroup(group);
         setSelectedUser(null);
         setMessages([]);
+        setCallHistory([]);
+        setPhotoViewerMessageId(null);
         setMessageSearch("");
         setShowMessageSearch(false);
         setReplyingTo(null);
@@ -1124,7 +1445,7 @@ if (
 
         try {
             const response = await axios.get(
-                `http://localhost:3030/groups/${group._id}/messages`
+                apiUrl(`/groups/${group._id}/messages`)
             );
 
             const loadedMessages =
@@ -1144,14 +1465,18 @@ if (
     const addMembersToGroup = async () => {
         if (
             !selectedGroup ||
-            selectedMembers.length === 0
+            selectedMembers.length === 0 ||
+            addingMembers
         ) {
             return;
         }
 
+        setAddingMembers(true);
+        setAddMembersError("");
+        setAddMembersNotice("");
         try {
             const response = await axios.put(
-                `http://localhost:3030/groups/${selectedGroup._id}/members`,
+                apiUrl(`/groups/${selectedGroup._id}/members`),
                 {
                     members: selectedMembers
                 }
@@ -1174,14 +1499,12 @@ if (
             );
 
             setSelectedMembers([]);
-            setMemberSearch("");
-            setShowAddMembers(false);
+            setAddMembersNotice("Members were added to the group.");
 
         } catch (error) {
-            console.log(
-                error.response?.data ||
-                error.message
-            );
+            setAddMembersError(error.response?.data?.message || "Members could not be added. Try again.");
+        } finally {
+            setAddingMembers(false);
         }
     };
 
@@ -1200,7 +1523,7 @@ if (
 
         try {
             const response = await axios.post(
-                "http://localhost:3030/groups",
+                apiUrl("/groups"),
                 {
                     name: groupName,
                     members: newGroupMembers
@@ -1285,21 +1608,58 @@ if (
             e.target.value;
 
         setMessage(value);
+        setMessageSendError("");
 
-        if (!selectedUser) {
+        const payload = selectedGroup
+            ? { senderId: userId, groupId: selectedGroup._id }
+            : selectedUser
+                ? (isSelfChat ? null : { senderId: userId, receiverId: selectedUser._id })
+                : null;
+        if (!payload) return;
+        const key = selectedGroup ? `group:${selectedGroup._id}` : `private:${selectedUser._id}`;
+        const nextTyping = value.length > 0;
+        if (!nextTyping) {
+            if (typingStateRef.current.isTyping && typingStateRef.current.payload) {
+                socket.emit("typing", { ...typingStateRef.current.payload, isTyping: false });
+            }
+            window.clearInterval(typingHeartbeatRef.current);
+            window.clearTimeout(typingStopTimeoutRef.current);
+            typingHeartbeatRef.current = null;
+            typingStopTimeoutRef.current = null;
+            typingStateRef.current = { key: null, payload: null, isTyping: false };
             return;
         }
 
-        socket.emit(
-            "typing",
-            {
-                senderId: userId,
-                receiverId:
-                    selectedUser._id,
-                isTyping:
-                    value.length > 0
-            }
-        );
+        const alreadyTypingHere = typingStateRef.current.key === key && typingStateRef.current.isTyping;
+        typingStateRef.current = { key, payload, isTyping: true };
+        if (!alreadyTypingHere) {
+            socket.emit("typing", { ...payload, isTyping: true });
+            window.clearInterval(typingHeartbeatRef.current);
+            typingHeartbeatRef.current = window.setInterval(() => {
+                socket.emit("typing", { ...payload, isTyping: true });
+            }, 2500);
+        }
+        window.clearTimeout(typingStopTimeoutRef.current);
+        typingStopTimeoutRef.current = window.setTimeout(() => {
+            if (typingStateRef.current.key !== key || !typingStateRef.current.isTyping) return;
+            socket.emit("typing", { ...payload, isTyping: false });
+            typingStateRef.current = { key: null, payload: null, isTyping: false };
+            window.clearInterval(typingHeartbeatRef.current);
+            typingHeartbeatRef.current = null;
+        }, 3500);
+    };
+
+    const clearTypingForCurrentChat = () => {
+        if (typingStateRef.current.isTyping && typingStateRef.current.payload) {
+            socket.emit("typing", { ...typingStateRef.current.payload, isTyping: false });
+        }
+        window.clearInterval(typingHeartbeatRef.current);
+        window.clearTimeout(typingStopTimeoutRef.current);
+        typingHeartbeatRef.current = null;
+        typingStopTimeoutRef.current = null;
+        typingStateRef.current = { key: null, payload: null, isTyping: false };
+        setIsTyping(false);
+        setGroupTypingUsers({});
     };
 
     const sendMessage = () => {
@@ -1315,6 +1675,12 @@ if (
             return;
         }
 
+        if (!socket.connected) {
+            setMessageSendError("Reconnect before sending this message.");
+            return;
+        }
+
+        setMessageSendError("");
         socket.emit(
             "sendMessage",
             {
@@ -1324,22 +1690,18 @@ if (
                 message:
                     message.trim(),
                 replyTo: getReplyPayload()
+            },
+            (result) => {
+                if (!result?.ok) {
+                    setMessageSendError(result?.message || "The message could not be sent. Your text is still here to retry.");
+                    return;
+                }
+                clearTypingForCurrentChat();
+                setMessage("");
+                setReplyingTo(null);
+                setShowEmoji(false);
             }
         );
-
-        socket.emit(
-            "typing",
-            {
-                senderId: userId,
-                receiverId:
-                    selectedUser._id,
-                isTyping: false
-            }
-        );
-
-        setMessage("");
-        setReplyingTo(null);
-        setShowEmoji(false);
     };
 
     const sendGroupMessage = () => {
@@ -1361,6 +1723,8 @@ if (
                 replyTo: getReplyPayload()
             }
         );
+
+        clearTypingForCurrentChat();
 
         setMessage("");
         setReplyingTo(null);
@@ -1463,7 +1827,7 @@ if (
             formData.append("file", file);
 
             const response = await axios.post(
-                "http://localhost:3030/upload",
+                apiUrl("/upload"),
                 formData
             );
 
@@ -1479,16 +1843,31 @@ if (
                 replyTo: getReplyPayload()
             };
 
+            const sendWithAcknowledgement = (eventName, payload) => new Promise((resolve, reject) => {
+                if (!socket.connected) {
+                    reject(new Error("Reconnect before sending this attachment."));
+                    return;
+                }
+                const timeout = window.setTimeout(() => reject(new Error("The server did not confirm the attachment. Try again.")), 15000);
+                socket.emit(eventName, payload, (result) => {
+                    window.clearTimeout(timeout);
+                    if (result?.ok) resolve();
+                    else reject(new Error(result?.message || "The attachment could not be sent. Try again."));
+                });
+            });
+
             if (selectedGroup) {
-                socket.emit("sendGroupMessage", {
+                await sendWithAcknowledgement("sendGroupMessage", {
                     ...attachmentMessage,
                     groupId: selectedGroup._id
                 });
             } else if (selectedUser) {
-                socket.emit("sendMessage", {
+                await sendWithAcknowledgement("sendMessage", {
                     ...attachmentMessage,
                     receiverId: selectedUser._id
                 });
+            } else {
+                return;
             }
 
             setShowAttachment(false);
@@ -1497,18 +1876,14 @@ if (
 
         } catch (error) {
 
-            console.log(
-                "File upload error:",
-                error.response?.data || error.message
-            );
-
-            alert("File upload failed");
-            input.value = "";
+            console.log("Attachment send error:", error.response?.data || error.message);
+            alert(error.response?.data?.message || error.message || "Attachment could not be sent. Select it again to retry.");
 
         }
     };
 
     const startRecording = async () => {
+        if (voicePreview) return;
         if (selectedUser && (isSelectedUserBlocked || selectedUser.isDeleted)) {
             alert("Private voice messages are unavailable for this user.");
             return;
@@ -1530,8 +1905,9 @@ if (
                 "audio/webm",
                 "audio/mp4"
             ];
+            if (typeof MediaRecorder === "undefined") throw new Error("Voice recording is not supported by this browser");
             const mimeType = mimeTypes.find((type) =>
-                MediaRecorder.isTypeSupported(type)
+                MediaRecorder.isTypeSupported?.(type)
             );
             const recorder = mimeType
                 ? new MediaRecorder(stream, { mimeType })
@@ -1542,6 +1918,14 @@ if (
                 if (event.data.size > 0) {
                     audioChunks.push(event.data);
                 }
+            };
+            recorder.onerror = () => {
+                discardRecordingRef.current = true;
+                stream.getTracks().forEach((track) => track.stop());
+                mediaRecorderRef.current = null;
+                setMediaRecorder(null);
+                setIsRecording(false);
+                alert("Recording stopped because of a microphone error. Please try again.");
             };
 
             recorder.onstop = async () => {
@@ -1554,8 +1938,17 @@ if (
                 stream.getTracks().forEach((track) => {
                     track.stop();
                 });
+                mediaRecorderRef.current = null;
+                setMediaRecorder(null);
+                setIsRecording(false);
+
+                if (discardRecordingRef.current) {
+                    discardRecordingRef.current = false;
+                    return;
+                }
 
                 if (!audioBlob.size) {
+                    alert("No audio was recorded. Please try again.");
                     return;
                 }
 
@@ -1568,52 +1961,31 @@ if (
                     ? "mp4"
                     : "webm";
                 const fileName = `voice-${Date.now()}.${extension}`;
-                const formData = new FormData();
-
-                formData.append("file", audioBlob, fileName);
-
-                try {
-                    const response = await axios.post(
-                        "http://localhost:3030/upload",
-                        formData
-                    );
-
-                    const uploadedFile = response.data.file;
-                    const voiceMessage = {
-                        senderId: userId,
-                        message: "Voice message",
-                        messageType: "audio",
-                        fileName: uploadedFile.fileName,
-                        fileUrl: uploadedFile.fileUrl,
-                        fileType: uploadedFile.fileType,
-                        fileSize: uploadedFile.fileSize,
-                        replyTo: getReplyPayload()
-                    };
-
-                    if (selectedGroup) {
-                        socket.emit("sendGroupMessage", {
-                            ...voiceMessage,
-                            groupId: selectedGroup._id
-                        });
-                    } else if (selectedUser) {
-                        socket.emit("sendMessage", {
-                            ...voiceMessage,
-                            receiverId: selectedUser._id
-                        });
-                    }
-
-                    setReplyingTo(null);
-
-                } catch (error) {
-                    console.log(
-                        "Voice upload error:",
-                        error.response?.data || error.message
-                    );
-                }
+                const target = selectedGroup
+                    ? { groupId: selectedGroup._id, label: selectedGroup.name }
+                    : selectedUser
+                        ? { receiverId: selectedUser._id, label: selectedUser.username }
+                        : null;
+                if (!target) return;
+                const preview = {
+                    url: URL.createObjectURL(audioBlob),
+                    file: audioBlob,
+                    fileName,
+                    duration: Math.max(1, Math.round((Date.now() - recordingStartedAtRef.current) / 1000)),
+                    target,
+                    replyTo: getReplyPayload(),
+                    uploadedFile: null,
+                    error: ""
+                };
+                setVoicePreview(preview);
             };
 
             recorder.start();
+            discardRecordingRef.current = false;
+            mediaRecorderRef.current = recorder;
             setMediaRecorder(recorder);
+            recordingStartedAtRef.current = Date.now();
+            setRecordingSeconds(0);
             setIsRecording(true);
             setShowAttachment(false);
             setShowEmoji(false);
@@ -1623,15 +1995,74 @@ if (
                 track.stop();
             });
             console.log("Microphone error:", error);
-            alert("Microphone permission is required");
+            alert(error.message === "Microphone recording is unavailable" || error.message.startsWith("Voice recording is not supported")
+                ? error.message
+                : "Microphone permission is required to record a voice message.");
         }
     };
 
     const stopRecording = () => {
         if (mediaRecorder?.state === "recording") {
             mediaRecorder.stop();
-            setMediaRecorder(null);
-            setIsRecording(false);
+        }
+    };
+
+    const cancelRecording = () => {
+        if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+        discardRecordingRef.current = true;
+        mediaRecorder.stop();
+    };
+
+    const discardVoicePreview = () => {
+        setVoicePreview((previous) => {
+            if (previous?.url) URL.revokeObjectURL(previous.url);
+            return null;
+        });
+    };
+
+    const sendVoicePreview = async () => {
+        if (!voicePreview || voiceSending) return;
+        if (!socket.connected) {
+            setVoicePreview((previous) => ({ ...previous, error: "Reconnect to send this recording." }));
+            return;
+        }
+        setVoiceSending(true);
+        setVoicePreview((previous) => ({ ...previous, error: "" }));
+        try {
+            let uploadedFile = voicePreview.uploadedFile;
+            if (!uploadedFile) {
+                const formData = new FormData();
+                formData.append("file", voicePreview.file, voicePreview.fileName);
+                const response = await axios.post(apiUrl("/upload"), formData);
+                uploadedFile = response.data.file;
+                setVoicePreview((previous) => ({ ...previous, uploadedFile }));
+            }
+
+            const payload = {
+                message: "Voice message",
+                messageType: "audio",
+                fileName: uploadedFile.fileName,
+                fileUrl: uploadedFile.fileUrl,
+                fileType: uploadedFile.fileType,
+                fileSize: uploadedFile.fileSize,
+                replyTo: voicePreview.replyTo,
+                ...voicePreview.target
+            };
+            const eventName = voicePreview.target.groupId ? "sendGroupMessage" : "sendMessage";
+            await new Promise((resolve, reject) => {
+                const timeout = window.setTimeout(() => reject(new Error("The server did not confirm the message.")), 15000);
+                socket.emit(eventName, payload, (acknowledgement) => {
+                    window.clearTimeout(timeout);
+                    if (acknowledgement?.ok) resolve();
+                    else reject(new Error(acknowledgement?.message || "The voice message could not be sent."));
+                });
+            });
+            discardVoicePreview();
+            setReplyingTo(null);
+        } catch (error) {
+            setVoicePreview((previous) => ({ ...previous, error: error.response?.data?.message || error.message || "The voice message could not be sent." }));
+        } finally {
+            setVoiceSending(false);
         }
     };
 
@@ -1679,9 +2110,6 @@ if (
                 (
                     user.username
                         ?.toLowerCase()
-                        .includes(searchValue) ||
-                    user.email
-                        ?.toLowerCase()
                         .includes(searchValue)
                 )
         );
@@ -1710,6 +2138,27 @@ if (
                 .includes(messageSearchValue)
         );
 
+    const filteredCallHistory = selectedUser
+        ? callHistory.filter((call) =>
+            !messageSearchValue ||
+            `${call.callType} ${call.status} ${call.callerId === userId ? "outgoing" : "incoming"}`
+                .toLowerCase()
+                .includes(messageSearchValue)
+        )
+        : [];
+
+    const conversationItems = [
+        ...filteredMessages.map((record) => ({ kind: "message", record, date: record.createdAt })),
+        ...filteredCallHistory.map((record) => ({ kind: "call", record, date: record.initiatedAt }))
+    ].sort((first, second) => new Date(first.date) - new Date(second.date));
+
+    const photoImages = messages.filter((msg) => msg.messageType === "image" && msg.fileUrl);
+    const openPhotoViewer = (messageId) => {
+        if (photoImages.some((image) => image._id === messageId)) {
+            setPhotoViewerMessageId(messageId);
+        }
+    };
+
     const memberSearchValue =
         memberSearch
             .trim()
@@ -1720,6 +2169,8 @@ if (
             ? users
                 .filter(
                     (user) =>
+                        user.isDeleted !== true &&
+                        user.isDeleting !== true &&
                         !selectedGroup.members.some(
                             (member) =>
                                 member._id?.toString() ===
@@ -1729,11 +2180,6 @@ if (
                 .filter(
                     (user) =>
                         user.username
-                            ?.toLowerCase()
-                            .includes(
-                                memberSearchValue
-                            ) ||
-                        user.email
                             ?.toLowerCase()
                             .includes(
                                 memberSearchValue
@@ -1800,7 +2246,7 @@ if (
         if (!reportDraft || !window.confirm("Submit this message report? Your report is private and will not be shown to the sender.")) return;
         setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: true, message: "" } }));
         try {
-            await axios.post(`http://localhost:3030/messages/${reportDraft._id}/report`, {
+            await axios.post(apiUrl(`/messages/${reportDraft._id}/report`), {
                 reason: reportReason,
                 details: reportDetails
             });
@@ -1874,8 +2320,7 @@ if (
                 height: "46px",
                 minWidth: "46px",
                 borderRadius: "15px",
-                background:
-                    "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                background: "var(--cs-brand)",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -1894,8 +2339,9 @@ if (
 
                 if (senderUser?.profilePhoto) {
                     return (
-                        <img
-                            src={`http://localhost:3030${senderUser.profilePhoto}`}
+                        <ProtectedImage
+                            path={`/media/profiles/${senderUser._id}`}
+                            refreshKey={senderUser.profilePhoto}
                             alt=""
                             style={{
                                 width: "100%",
@@ -1969,7 +2415,7 @@ if (
                         height: "7px",
                         minWidth: "7px",
                         borderRadius: "50%",
-                        background: "#6366f1"
+                        background: "var(--cs-brand)"
                     }}
                 />
 
@@ -2023,6 +2469,13 @@ if (
                 onEnd={() => closeCall(true)}
             />
 
+            <PhotoViewer
+                images={photoImages}
+                activeIndex={photoImages.findIndex((image) => image._id === photoViewerMessageId)}
+                onClose={() => setPhotoViewerMessageId(null)}
+                onNavigate={(index) => setPhotoViewerMessageId(photoImages[index]?._id || null)}
+            />
+
             <div
                 className="cs-sidebar"
                 style={{
@@ -2055,11 +2508,7 @@ if (
                         }}
                     >
                         <div className="cs-brand-lockup">
-                            <div className="cs-brand-mark">CS</div>
-                            <div className="cs-brand-copy">
-                                <strong>ChatSpace</strong>
-                                <small>Real-Time Communication Platform</small>
-                            </div>
+                            <ChatSpaceLogo className="cs-sidebar-logo" showTagline />
                         </div>
 
                         <div className="cs-profile-menu-wrap">
@@ -2073,8 +2522,9 @@ if (
                                 }
                             >
                                 {profileUser?.profilePhoto ? (
-                                    <img
-                                        src={`http://localhost:3030${profileUser.profilePhoto}`}
+                                    <ProtectedImage
+                                        path={`/media/profiles/${profileUser._id}`}
+                                        refreshKey={profileUser.profilePhoto}
                                         alt=""
                                     />
                                 ) : (
@@ -2132,6 +2582,8 @@ if (
                         <Search size={17} aria-hidden="true" />
 
                         <input
+                            id="conversation-search"
+                            name="conversationSearch"
                             aria-label="Search conversations, people, and groups"
                             value={search}
                             onChange={(e) =>
@@ -2226,7 +2678,7 @@ if (
                             style={{
                                 border: "none",
                                 background: "transparent",
-                                color: "#128c7e",
+                                color: "var(--cs-brand)",
                                 fontSize: "24px",
                                 cursor: "pointer",
                                 fontWeight: "bold",
@@ -2313,17 +2765,14 @@ if (
                                     </strong>
 
                                     <small
-                                        style={{
-                                            color:
-                                                "#667781"
-                                        }}
+                                        className="cs-sidebar-group-meta"
+                                        data-typing={Object.keys(sidebarTyping[`group:${group._id}`] || {}).length > 0}
                                     >
-                                        {
-                                            group
-                                                .members
-                                                .length
-                                        }{" "}
-                                        members
+                                        {Object.keys(sidebarTyping[`group:${group._id}`] || {}).length > 0
+                                            ? Object.keys(sidebarTyping[`group:${group._id}`] || {}).length === 1
+                                                ? `${Object.values(sidebarTyping[`group:${group._id}`] || {})[0]} is typing…`
+                                                : `${Object.keys(sidebarTyping[`group:${group._id}`] || {}).length} people typing…`
+                                            : `${group.members.length} members`}
                                     </small>
                                 </div>
                             </div>
@@ -2345,6 +2794,55 @@ if (
                     >
                         CHATS
                     </div>
+
+                    {profileUser && !["groups", "friends"].includes(activeFilter) &&
+                        (!searchValue || ["you", "message yourself", "my notes", profileUser.username?.toLowerCase()]
+                            .some((label) => label?.includes(searchValue))) && (
+                        <div
+                            role="button"
+                            tabIndex={0}
+                            className="cs-conversation-item"
+                            data-active={isSelfChat}
+                            onClick={() => selectUser(profileUser)}
+                            onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    selectUser(profileUser);
+                                }
+                            }}
+                            aria-label="Open Message yourself"
+                            style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "12px",
+                                padding: "12px 16px",
+                                cursor: "pointer"
+                            }}
+                        >
+                            <div style={{
+                                width: "48px",
+                                height: "48px",
+                                borderRadius: "50%",
+                                background: "#dfe5e7",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontSize: "21px",
+                                position: "relative",
+                                overflow: "hidden"
+                            }}>
+                            {profileUser.profilePhoto ? (
+                                <ProtectedImage style={{ width: "100%", height: "100%", objectFit: "cover" }} path={`/media/profiles/${profileUser._id}`} refreshKey={profileUser.profilePhoto} alt="" />
+                            ) : (
+                                <>👤</>
+                            )}
+                            </div>
+                            <span style={{ flex: 1, minWidth: 0 }}>
+                                <strong>You</strong>
+                                <div className="cs-sidebar-user-presence">Save messages</div>
+                            </span>
+                        </div>
+                    )}
 
                     {filteredUsers.map(
                         (user) => (
@@ -2424,29 +2922,18 @@ if (
                                 >
                                     <strong>{user.username}</strong>
 
-                                    <div
-                                        style={{
-                                            marginTop: "4px",
-                                            fontSize: "12px",
-                                            color: lastMessages[user._id]
-                                                ? "#667781"
-                                                : user.isOnline
-                                                    ? "#25a244"
-                                                    : "#667781",
-                                            overflow: "hidden",
-                                            textOverflow: "ellipsis",
-                                            whiteSpace: "nowrap"
-                                        }}
-                                    >
-                                        {lastMessages[user._id] ||
-                                            (user.isOnline ? "Online" : "Offline")}
+                                    <div className="cs-sidebar-user-presence" data-typing={Boolean(sidebarTyping[`private:${user._id}`])} data-online={Boolean(user.isOnline)}>
+                                        {sidebarTyping[`private:${user._id}`] ? "typing..." : user.isOnline ? "Online" : "Offline"}
                                     </div>
+                                    {lastMessages[user._id] && (
+                                        <small className="cs-sidebar-last-message">{lastMessages[user._id]}</small>
+                                    )}
                                 </div>
 
                                 {unreadCounts[user._id] > 0 && (
                                     <span
                                         style={{
-                                            background: "#25d366",
+                                            background: "var(--cs-brand)",
                                             color: "#ffffff",
                                             borderRadius: "50%",
                                             minWidth: "20px",
@@ -2515,6 +3002,7 @@ if (
                                 className="cs-mobile-back"
                                 aria-label="Back to conversations"
                                 onClick={() => {
+                                    clearTypingForCurrentChat();
                                     setSelectedGroup(null);
                                     setMessages([]);
                                 }}
@@ -2561,21 +3049,19 @@ if (
                                     </strong>
 
                                     <div
+                                        className="cs-group-header-meta"
                                         style={{
                                             marginTop:
                                                 "4px",
-                                            color:
-                                                "#667781",
                                             fontSize:
                                                 "13px"
                                         }}
                                     >
-                                        {
-                                            selectedGroup
-                                                .members
-                                                .length
-                                        }{" "}
-                                        members
+                                        {Object.keys(groupTypingUsers).length === 1
+                                            ? `${Object.values(groupTypingUsers)[0]} is typing…`
+                                            : Object.keys(groupTypingUsers).length > 1
+                                                ? `${Object.keys(groupTypingUsers).length} members are typing…`
+                                                : `${selectedGroup.members.length} members`}
                                     </div>
                                 </div>
                             </div>
@@ -2583,6 +3069,9 @@ if (
                             {selectedGroup.admin?.toString() ===
                                 userId?.toString() && (
                                 <button
+                                    type="button"
+                                    className="cs-add-members-trigger"
+                                    aria-haspopup="dialog"
                                     onClick={() => {
                                         setSelectedMembers(
                                             []
@@ -2593,12 +3082,14 @@ if (
                                         setShowAddMembers(
                                             true
                                         );
+                                        setAddMembersError("");
+                                        setAddMembersNotice("");
                                     }}
                                     style={{
                                         border:
                                             "none",
                                         background:
-                                            "#25d366",
+                                            "var(--cs-brand)",
                                         color:
                                             "#ffffff",
                                         padding:
@@ -2654,6 +3145,7 @@ if (
                                 className="cs-mobile-back"
                                 aria-label="Back to conversations"
                                 onClick={() => {
+                                    clearTypingForCurrentChat();
                                     setSelectedUser(null);
                                     setMessages([]);
                                 }}
@@ -2692,22 +3184,17 @@ if (
 
     <div>
         <strong>
-            {selectedUser.username}
+            {isSelfChat ? "You" : selectedUser.username}
         </strong>
 
         <div
-            style={{
-                marginTop: "4px",
-                color:
-                    isTyping
-                        ? "#111827"
-                        : selectedUser.isOnline
-                            ? "#25a244"
-                            : "#667781",
-                fontSize: "13px"
-            }}
+            className="cs-chat-presence"
+            data-state={isTyping ? "typing" : selectedUser.isOnline ? "online" : "offline"}
+            style={{ marginTop: "4px", fontSize: "13px" }}
         >
-            {isTyping
+            {isSelfChat
+                ? "Message yourself"
+                : isTyping
                 ? "typing..."
                 : selectedUser.isOnline
                     ? "online"
@@ -2725,7 +3212,7 @@ if (
                                 >
                                     <Search size={18} />
                                 </button>
-                                <button
+                                {!isSelfChat && <button
                                     type="button"
                                     aria-label="Start voice call"
                                     title="Voice call"
@@ -2733,8 +3220,8 @@ if (
                                     disabled={Boolean(callState || incomingCall || isSelectedUserBlocked || selectedUser?.isDeleted)}
                                 >
                                     <Phone size={18} />
-                                </button>
-                                <button
+                                </button>}
+                                {!isSelfChat && <button
                                     type="button"
                                     aria-label="Start video call"
                                     title="Video call"
@@ -2742,7 +3229,7 @@ if (
                                     disabled={Boolean(callState || incomingCall || isSelectedUserBlocked || selectedUser?.isDeleted)}
                                 >
                                     <Video size={18} />
-                                </button>
+                                </button>}
                                 <button
                                     type="button"
                                     aria-label="Chat information"
@@ -2760,11 +3247,10 @@ if (
                             </strong>
 
                             <div
+                                className="cs-chat-header-hint"
                                 style={{
                                     fontSize:
                                         "13px",
-                                    color:
-                                        "#667781",
                                     marginTop:
                                         "4px"
                                 }}
@@ -2777,8 +3263,8 @@ if (
 
                 {showMessageSearch && (
                     <div
+                        className="cs-message-search-bar"
                         style={{
-                            background: "#f0f2f5",
                             padding: "8px 12px",
                             display: "flex",
                             alignItems: "center",
@@ -2786,6 +3272,8 @@ if (
                         }}
                     >
                         <input
+                            id="message-search"
+                            name="messageSearch"
                             type="text"
                             placeholder="Search messages..."
                             value={messageSearch}
@@ -2797,16 +3285,15 @@ if (
                                 flex: 1,
                                 border: "none",
                                 outline: "none",
-                                background: "#ffffff",
                                 borderRadius: "20px",
                                 padding: "9px 14px",
-                                fontSize: "14px",
-                                color: "#111111"
+                                fontSize: "14px"
                             }}
                         />
 
                         <button
                             type="button"
+                            className="cs-message-search-close"
                             aria-label="Close message search"
                             onClick={() => {
                                 setMessageSearch("");
@@ -2827,11 +3314,8 @@ if (
 
                 {selectedGroup && (
                     <details
+                        className="cs-group-members-disclosure"
                         style={{
-                            background:
-                                "#ffffff",
-                            borderBottom:
-                                "1px solid #ddd",
                             padding:
                                 "8px 20px"
                         }}
@@ -2841,7 +3325,7 @@ if (
                                 cursor:
                                     "pointer",
                                 color:
-                                    "#128c7e",
+                                    "var(--cs-brand)",
                                 fontWeight:
                                     "600"
                             }}
@@ -2849,41 +3333,28 @@ if (
                             View group members
                         </summary>
 
-                        <div
-                            style={{
-                                marginTop:
-                                    "8px",
-                                display:
-                                    "flex",
-                                gap:
-                                    "8px",
-                                flexWrap:
-                                    "wrap"
-                            }}
-                        >
+                        <div className="cs-group-members-list">
                             {selectedGroup.members.map(
                                 (member) => (
                                     <span
+                                        className="cs-group-member-row"
                                         key={
                                             member._id
                                         }
-                                        style={{
-                                            padding:
-                                                "7px 10px",
-                                            borderRadius:
-                                                "15px",
-                                            background:
-                                                "#f0f2f5",
-                                            fontSize:
-                                                "13px"
-                                        }}
                                     >
-                                        {member.username}
+                                        {member.profilePhoto ? (
+                                            <ProtectedImage className="cs-group-member-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt="" />
+                                        ) : (
+                                            <span className="cs-group-member-avatar cs-group-member-fallback" aria-hidden="true">{member.username?.slice(0, 1)?.toUpperCase() || <UserRound size={15} />}</span>
+                                        )}
+                                        <span className="cs-group-member-name">{member.username}</span>
+                                        <span className="cs-group-member-status" data-online={Boolean(member.isOnline)}><i aria-hidden="true" />{member.isOnline ? "Online" : "Offline"}</span>
 
                                         {member._id?.toString() ===
                                             selectedGroup.admin?.toString()
                                             ? " 👑"
                                             : ""}
+                                        {member._id?.toString() === selectedGroup.admin?.toString() && <span className="cs-admin-badge">Admin</span>}
                                     </span>
                                 )
                             )}
@@ -2893,6 +3364,9 @@ if (
 
                 <div
                     className="cs-message-list"
+                    data-wallpaper={chatBackground}
+                    data-message-style={messageStyle}
+                    data-message-font={messageFont}
                     onClick={() => {
                         setOpenMenu(null);
                         setShowEmoji(false);
@@ -2903,13 +3377,7 @@ if (
                         overflowY:
                             "auto",
                         padding:
-                            "24px",
-                        background:
-                            "#efeae2",
-                        backgroundImage:
-                            "radial-gradient(#d8d1c8 1px, transparent 1px)",
-                        backgroundSize:
-                            "18px 18px"
+                            "24px"
                     }}
                 >
                     {!selectedUser &&
@@ -2928,32 +3396,35 @@ if (
                                     "center"
                             }}
                         >
-                            <div>
-                                <div
-                                    style={{
-                                        fontSize:
-                                            "60px"
-                                    }}
-                                >
-                                    💬
+                            <div className="cs-empty-welcome">
+                                <span className="cs-welcome-product">Real-Time Chat</span>
+                                <span className="cs-welcome-eyebrow">YOUR SPACE TO CONNECT</span>
+                                <div className="cs-welcome-icon" aria-hidden="true">
+                                    <MessageCircle size={31} strokeWidth={1.8} />
                                 </div>
-
-                                <h2>
-                                    Welcome to Real-Time Chat
-                                </h2>
-
-                                <p
-                                    style={{
-                                        color:
-                                            "#667781"
-                                    }}
-                                >
-                                    Select a person or group
-                                    to start chatting
-                                </p>
+                                <h1>Welcome to Real-Time Chat</h1>
+                                <h2>Conversations that bring people closer.</h2>
+                                <p className="cs-welcome-lead">Select a chat to start messaging</p>
+                                <p className="cs-welcome-copy">Select a person or group to start chatting.</p>
+                                <p className="cs-welcome-copy">Your people, your groups, your moments. Everything you need to stay connected in one place.</p>
+                                <div className="cs-welcome-features">
+                                    <article>
+                                        <strong>Private conversations</strong>
+                                        <span>Chat one-to-one in real time.</span>
+                                    </article>
+                                    <article>
+                                        <strong>Groups that feel connected</strong>
+                                        <span>Bring your people together.</span>
+                                    </article>
+                                    <article>
+                                        <strong>More than messages</strong>
+                                        <span>Share files, images and voice messages.</span>
+                                    </article>
+                                </div>
+                                <p className="cs-welcome-footer">A little closer, wherever you are.</p>
                             </div>
                         </div>
-                    ) : messages.length === 0 ? (
+                    ) : messages.length === 0 && callHistory.length === 0 ? (
                         <div
                             style={{
                                 textAlign:
@@ -2987,7 +3458,7 @@ if (
                                 Start chatting!
                             </p>
                         </div>
-                    ) : filteredMessages.length === 0 ? (
+                    ) : conversationItems.length === 0 ? (
                         <p
                             style={{
                                 textAlign: "center",
@@ -2997,8 +3468,19 @@ if (
                             No matching messages.
                         </p>
                     ) : (
-                        filteredMessages.map(
-                            (msg) => {
+                        conversationItems.map(
+                            ({ kind, record }) => {
+                                if (kind === "call") {
+                                    return (
+                                        <CallHistoryEntry
+                                            key={`call-${record.callId}`}
+                                            call={record}
+                                            currentUserId={userId}
+                                        />
+                                    );
+                                }
+
+                                const msg = record;
                                 const own =
                                     isOwnMessage(
                                         msg
@@ -3038,6 +3520,8 @@ if (
                                             }}
                                         >
                                             <div
+                                                className="cs-message-content"
+                                                data-own={own}
                                                 style={{
                                                     padding:
                                                         "8px 10px 6px",
@@ -3045,19 +3529,15 @@ if (
                                                         own
                                                             ? "8px 0 8px 8px"
                                                             : "0 8px 8px 8px",
-                                                    background:
-                                                        own
-                                                            ? "#d9fdd3"
-                                                            : "#ffffff",
                                                     boxShadow:
                                                         "0 1px 2px rgba(0,0,0,0.15)"
                                                 }}
                                             >
                                                     {msg.replyTo?.messageId && (
                                                         <div
+                                                            className="cs-message-reply-preview"
                                                             style={{
-                                                                borderLeft: "3px solid #00a884",
-                                                                background: "rgba(0,0,0,0.04)",
+                                                                borderLeft: "3px solid var(--cs-brand)",
                                                                 borderRadius: "4px",
                                                                 padding: "5px 8px",
                                                                 marginBottom: "7px",
@@ -3065,8 +3545,8 @@ if (
                                                             }}
                                                         >
                                                             <div
+                                                                className="cs-message-reply-sender"
                                                                 style={{
-                                                                    color: "#008069",
                                                                     fontWeight: "bold",
                                                                     fontSize: "12px"
                                                                 }}
@@ -3074,8 +3554,8 @@ if (
                                                                 {msg.replyTo.senderName || "User"}
                                                             </div>
                                                             <div
+                                                                className="cs-message-reply-text"
                                                                 style={{
-                                                                    color: "#344054",
                                                                     fontSize: "12px",
                                                                     whiteSpace: "nowrap",
                                                                     overflow: "hidden",
@@ -3094,9 +3574,10 @@ if (
                                                 {selectedGroup &&
                                                     !own && (
                                                         <div
+                                                            className="cs-message-sender"
                                                             style={{
                                                                 color:
-                                                                    "#128c7e",
+                                                                    "var(--cs-message-link)",
                                                                 fontWeight:
                                                                     "bold",
                                                                 fontSize:
@@ -3112,6 +3593,7 @@ if (
                                                     )}
 
                                                 <div
+                                                    className="cs-message-layout"
                                                     style={{
                                                         display:
                                                             "flex",
@@ -3122,6 +3604,7 @@ if (
                                                     }}
                                                 >
                                                     <div
+                                                        className="cs-message-body"
                                                         style={{
                                                             flex:
                                                                 1,
@@ -3136,10 +3619,8 @@ if (
                                                         }}
                                                     >
                                                             {msg.messageType === "audio" && msg.fileUrl ? (
-                                                                <audio
-                                                                    controls
-                                                                    preload="metadata"
-                                                                    src={`http://localhost:3030${msg.fileUrl}`}
+                                                                <ProtectedAudio
+                                                                    path={`/media/messages/${msg._id}`}
                                                                     style={{
                                                                         width: "240px",
                                                                         maxWidth: "100%"
@@ -3147,24 +3628,23 @@ if (
                                                                 />
                                                             ) : msg.messageType === "image" && msg.fileUrl ? (
                                                                 <div>
-                                                                    <img
-                                                                        src={`http://localhost:3030${msg.fileUrl}`}
-                                                                        alt={msg.fileName || "Image"}
-                                                                        style={{
-                                                                            width: "220px",
-                                                                            maxWidth: "100%",
-                                                                            borderRadius: "8px",
-                                                                            display: "block",
-                                                                            cursor: "pointer"
-                                                                        }}
-                                                                        onClick={() =>
-                                                                            window.open(
-                                                                                `http://localhost:3030${msg.fileUrl}`,
-                                                                                "_blank",
-                                                                                "noopener,noreferrer"
-                                                                            )
-                                                                        }
-                                                                    />
+                                                                    <button
+                                                                        type="button"
+                                                                        className="cs-message-image-trigger"
+                                                                        aria-label={`View ${msg.fileName || "shared photo"}`}
+                                                                        onClick={() => openPhotoViewer(msg._id)}
+                                                                    >
+                                                                        <ProtectedImage
+                                                                            path={`/media/messages/${msg._id}`}
+                                                                            alt={msg.fileName || "Image"}
+                                                                            style={{
+                                                                                width: "220px",
+                                                                                maxWidth: "100%",
+                                                                                borderRadius: "8px",
+                                                                                display: "block"
+                                                                            }}
+                                                                        />
+                                                                    </button>
 
                                                                     <div
                                                                         style={{
@@ -3205,9 +3685,9 @@ if (
                                                                         </div>
 
                                                                         <div
+                                                                            className="cs-message-file-meta"
                                                                             style={{
                                                                                 fontSize: "12px",
-                                                                                opacity: 0.7,
                                                                                 marginTop: "3px"
                                                                             }}
                                                                         >
@@ -3220,23 +3700,23 @@ if (
                                                                                 : ""}
                                                                         </div>
 
-                                                                        <a
-                                                                            href={`http://localhost:3030${msg.fileUrl}`}
-                                                                            target="_blank"
-                                                                            rel="noreferrer"
+                                                                        <ProtectedDownload
+                                                                            path={`/media/messages/${msg._id}`}
+                                                                            fileName={msg.fileName}
                                                                             style={{
                                                                                 display: "inline-block",
                                                                                 marginTop: "5px"
                                                                             }}
                                                                         >
                                                                             Open / Download
-                                                                        </a>
+                                                                        </ProtectedDownload>
                                                                     </div>
                                                                 </div>
                                                             ) : (
                                                                 splitMessageLinks(msg.message).map((part, index) => part.href ? (
                                                                     <a
                                                                         key={`${msg._id}-link-${index}`}
+                                                                        className="cs-message-link"
                                                                         href={part.href}
                                                                         target="_blank"
                                                                         rel="noopener noreferrer"
@@ -3271,7 +3751,7 @@ if (
                                                             fontSize:
                                                                 "17px",
                                                             color:
-                                                                "#667781",
+                                                                "var(--cs-readable-muted)",
                                                             padding:
                                                                 "0",
                                                             lineHeight:
@@ -3329,10 +3809,8 @@ if (
                                                             "2px"
                                                     }}
                                                 >
-                                                    <span
+                                                    <span className="cs-message-timestamp"
                                                         style={{
-                                                            color:
-                                                                "#667781",
                                                             fontSize:
                                                                 "10px"
                                                         }}
@@ -3359,11 +3837,9 @@ if (
 
                                                     {own && (
                                                         <span
+                                                            className="cs-message-status"
+                                                            data-read={profileUser?.readReceiptsEnabled !== false && Boolean(msg.readBy?.length)}
                                                             style={{
-                                                                color:
-                                                                    msg.readBy?.length
-                                                                        ? "#53bdeb"
-                                                                        : "#667781",
                                                                 fontSize:
                                                                     "13px",
                                                                 fontWeight:
@@ -3606,10 +4082,10 @@ if (
                     >
                         {replyingTo && (
                             <div
+                                className="cs-composer-reply-preview"
                                 style={{
-                                    background: "#d9fdd3",
                                     padding: "8px 12px",
-                                    borderLeft: "4px solid #00a884",
+                                    borderLeft: "4px solid var(--cs-brand)",
                                     display: "flex",
                                     alignItems: "center",
                                     justifyContent: "space-between",
@@ -3624,8 +4100,8 @@ if (
                                     }}
                                 >
                                     <div
+                                        className="cs-composer-reply-sender"
                                         style={{
-                                            color: "#008069",
                                             fontWeight: "bold",
                                             fontSize: "13px",
                                             marginBottom: "3px"
@@ -3635,8 +4111,8 @@ if (
                                     </div>
 
                                     <div
+                                        className="cs-composer-reply-text"
                                         style={{
-                                            color: "#111111",
                                             fontSize: "14px",
                                             whiteSpace: "nowrap",
                                             overflow: "hidden",
@@ -3654,11 +4130,11 @@ if (
                                 <button
                                     type="button"
                                     aria-label="Cancel reply"
+                                    className="cs-composer-reply-dismiss"
                                     onClick={() => setReplyingTo(null)}
                                     style={{
                                         border: "none",
                                         background: "transparent",
-                                        color: "#111111",
                                         fontSize: "22px",
                                         cursor: "pointer",
                                         padding: "2px 6px",
@@ -3742,6 +4218,7 @@ if (
 
                         {showAttachment && (
                             <div
+                                className="cs-attachment-menu"
                                 style={{
                                     position:
                                         "absolute",
@@ -3758,12 +4235,13 @@ if (
                                     boxShadow:
                                         "0 4px 20px rgba(0,0,0,0.2)",
                                     zIndex:
-                                        100,
+                                        120,
                                     minWidth:
                                         "190px"
                                 }}
                             >
                                 <label
+                                    className="cs-attachment-option"
                                     style={{
                                         display:
                                             "block",
@@ -3775,6 +4253,8 @@ if (
                                 >
                                     🖼️ Photos & videos
                                     <input
+                                        id="attachment-photo-video"
+                                        name="photoVideoAttachment"
                                         type="file"
                                         accept="image/*,video/*"
                                         onChange={
@@ -3788,6 +4268,7 @@ if (
                                 </label>
 
                                 <label
+                                    className="cs-attachment-option"
                                     style={{
                                         display:
                                             "block",
@@ -3799,6 +4280,8 @@ if (
                                 >
                                     📄 Document
                                     <input
+                                        id="attachment-document"
+                                        name="documentAttachment"
                                         type="file"
                                         accept=".pdf,.doc,.docx,.txt,.xlsx,.ppt,.pptx"
                                         onChange={
@@ -3812,6 +4295,7 @@ if (
                                 </label>
 
                                 <label
+                                    className="cs-attachment-option"
                                     style={{
                                         display:
                                             "block",
@@ -3823,6 +4307,8 @@ if (
                                 >
                                     📎 Any file
                                     <input
+                                        id="attachment-file"
+                                        name="fileAttachment"
                                         type="file"
                                         onChange={
                                             handleAttachment
@@ -3836,6 +4322,31 @@ if (
                             </div>
                         )}
 
+                        {isRecording && (
+                            <div className="cs-recording-indicator" role="status" aria-label="Recording voice message">
+                                <div className="cs-recording-time"><span className="cs-recording-dot" /> <span>Recording</span> <time>{Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")}</time></div>
+                                <div className="cs-recording-waveform" aria-hidden="true">
+                                    {Array.from({ length: 18 }, (_, index) => <i key={index} style={{ "--wave-index": index }} />)}
+                                </div>
+                                <div className="cs-recording-actions">
+                                    <button type="button" className="cs-recording-cancel" onClick={cancelRecording} aria-label="Discard recording"><X size={16} /> Discard</button>
+                                    <button type="button" className="cs-recording-stop" onClick={stopRecording} aria-label="Finish recording"><Square size={13} fill="currentColor" /> Finish</button>
+                                </div>
+                            </div>
+                        )}
+                        {voicePreview && (
+                            <div className="cs-voice-preview" aria-label={`Voice recording for ${voicePreview.target.label}`}>
+                                <audio controls preload="metadata" src={voicePreview.url} />
+                                <span className="cs-voice-duration">{Math.floor(voicePreview.duration / 60)}:{String(voicePreview.duration % 60).padStart(2, "0")}</span>
+                                <span className="cs-voice-target">For {voicePreview.target.label}</span>
+                                <button type="button" className="cs-voice-discard" aria-label="Discard recording" onClick={discardVoicePreview} disabled={voiceSending}><X size={17} /></button>
+                                <button type="button" className="cs-voice-send" onClick={sendVoicePreview} disabled={voiceSending}>{voiceSending ? "Sending…" : "Send recording"}</button>
+                                {voicePreview.error && <span className="cs-voice-error" role="alert">{voicePreview.error}</span>}
+                            </div>
+                        )}
+
+                        {messageSendError && <div className="cs-voice-error" role="alert">{messageSendError}</div>}
+
                         <div
                             style={{
                                 display:
@@ -3847,6 +4358,9 @@ if (
                             }}
                         >
                             <button
+                                type="button"
+                                className="cs-emoji-button"
+                                aria-label="Choose emoji"
                                 onClick={() => {
                                     setShowEmoji(
                                         !showEmoji
@@ -3870,9 +4384,13 @@ if (
                             >
                                 😊
                             </button>
-                                 <Smile size={20} />
 
                             <button
+                                type="button"
+                                className="cs-attach-button"
+                                aria-label="Attach files"
+                                aria-expanded={showAttachment}
+                                title="Attach files"
                                 onClick={() => {
                                     setShowAttachment(
                                         !showAttachment
@@ -3898,6 +4416,8 @@ if (
                             </button>
 
                             <input
+                                id="message-composer"
+                                name="message"
                                 type="text"
                                 placeholder="Type a message"
                                 value={message}
@@ -3937,18 +4457,23 @@ if (
                                 aria-label={
                                     isRecording
                                         ? "Stop recording"
-                                        : "Record voice message"
+                                        : voicePreview
+                                            ? "Send or discard the current recording first"
+                                            : "Record voice message"
                                 }
                                 title={
                                     isRecording
                                         ? "Stop recording"
-                                        : "Record voice message"
+                                        : voicePreview
+                                            ? "Send or discard the current recording first"
+                                            : "Record voice message"
                                 }
                                 onClick={
                                     isRecording
                                         ? stopRecording
                                         : startRecording
                                 }
+                                disabled={Boolean(voicePreview) && !isRecording}
                                 style={{
                                     border: "none",
                                     background: isRecording
@@ -3970,6 +4495,9 @@ if (
                             </button>
 
                             <button
+                                type="button"
+                                className="cs-send-button"
+                                aria-label="Send message"
                                 onClick={
                                     handleSendMessage
                                 }
@@ -3983,7 +4511,7 @@ if (
                                     border:
                                         "none",
                                     background:
-                                        "#128c7e",
+                                        "var(--cs-brand)",
                                     color:
                                         "#ffffff",
                                     cursor:
@@ -3992,9 +4520,8 @@ if (
                                         "18px"
                                 }}
                             >
-                                
+                                <Send size={18} />
                             </button>
-                                 <Send size={18} />
                         </div>
                     </div>
                 )}
@@ -4055,11 +4582,15 @@ if (
                     className="cs-info-member"
                     key={member._id}
                 >
-                    <span className="cs-mini-avatar">
-                        <UserRound size={15} />
-                    </span>
+                    {member.profilePhoto ? (
+                        <ProtectedImage className="cs-mini-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt="" />
+                    ) : (
+                        <span className="cs-mini-avatar">{member.username?.slice(0, 1)?.toUpperCase() || <UserRound size={15} />}</span>
+                    )}
 
                     <span>{member.username}</span>
+
+                    <span className="cs-group-member-status" data-online={Boolean(member.isOnline)}><i aria-hidden="true" />{member.isOnline ? "Online" : "Offline"}</span>
 
                     {member._id?.toString() ===
                         selectedGroup.admin?.toString() && (
@@ -4077,9 +4608,10 @@ if (
         <div className="cs-info-profile">
 
             {selectedUser.profilePhoto ? (
-                <img
+                <ProtectedImage
                     className="cs-info-avatar"
-                    src={`http://localhost:3030${selectedUser.profilePhoto}`}
+                    path={`/media/profiles/${selectedUser._id}`}
+                    refreshKey={selectedUser.profilePhoto}
                     alt={selectedUser.username}
                 />
             ) : (
@@ -4089,11 +4621,14 @@ if (
             )}
 
             <strong className="cs-info-username">
-                {selectedUser.username}
+                {isSelfChat ? "You" : selectedUser.username}
             </strong>
+            {isSelfChat && <span>@{selectedUser.username}</span>}
 
-            <span className="cs-info-status">
-                {selectedUser.isOnline
+            <span className="cs-info-status" data-personal={isSelfChat}>
+                {isSelfChat
+                    ? "Personal notes"
+                    : selectedUser.isOnline
                     ? "Online"
                     : "Offline"}
             </span>
@@ -4109,7 +4644,7 @@ if (
 
         </div>
 
-        <section className="cs-info-section">
+        {!isSelfChat && <section className="cs-info-section">
             <h3>Security</h3>
 
             <div className="cs-info-detail">
@@ -4123,14 +4658,15 @@ if (
                     </strong>
                 </div>
             </div>
-        </section>
+        </section>}
 
-        <section className="cs-info-section">
+        {!isSelfChat && <section className="cs-info-section">
             <h3>Privacy controls</h3>
             <p className="cs-info-muted">Blocking affects private messages and calls. Shared groups remain available.</p>
             {!selectedUser.isDeleted && (
                 <button
                     type="button"
+                    className="cs-private-chat-action"
                     onClick={() => setSelectedUserBlocked(!isSelectedUserBlocked)}
                     style={{ width: "100%", padding: "10px", cursor: "pointer", marginBottom: "8px" }}
                 >
@@ -4139,12 +4675,13 @@ if (
             )}
             <button
                 type="button"
+                className="cs-private-chat-action"
                 onClick={removeSelectedConversation}
                 style={{ width: "100%", padding: "10px", cursor: "pointer" }}
             >
                 Remove conversation
             </button>
-        </section>
+        </section>}
     </>
 ) : (
     <div className="cs-info-empty">
@@ -4170,24 +4707,21 @@ if (
                 )
                 .slice(-6)
                 .map((msg) => (
-                    <a
+                    <button
                         key={msg._id}
-                        href={`http://localhost:3030${msg.fileUrl}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        aria-label={
-                            msg.fileName ||
-                            "Open shared image"
-                        }
+                        type="button"
+                        className="cs-info-media-photo"
+                        aria-label={msg.fileName || "Open shared image"}
+                        onClick={() => openPhotoViewer(msg._id)}
                     >
-                        <img
-                            src={`http://localhost:3030${msg.fileUrl}`}
+                        <ProtectedImage
+                            path={`/media/messages/${msg._id}`}
                             alt={
                                 msg.fileName ||
                                 "Shared image"
                             }
                         />
-                    </a>
+                    </button>
                 ))}
         </div>
 
@@ -4213,12 +4747,11 @@ if (
             )
             .slice(-5)
             .map((msg) => (
-                <a
+                <ProtectedDownload
                     className="cs-info-file"
                     key={msg._id}
-                    href={`http://localhost:3030${msg.fileUrl}`}
-                    target="_blank"
-                    rel="noreferrer"
+                    path={`/media/messages/${msg._id}`}
+                    fileName={msg.fileName || "Voice message"}
                 >
                     <FileText size={16} />
 
@@ -4228,7 +4761,7 @@ if (
                     </span>
 
                     <ChevronRight size={15} />
-                </a>
+                </ProtectedDownload>
             ))}
 
         {messages.every(
@@ -4290,6 +4823,8 @@ if (
             {showAddMembers &&
                 selectedGroup && (
                     <div
+                        className="cs-add-members-backdrop"
+                        role="presentation"
                         onClick={() => {
                             setShowAddMembers(
                                 false
@@ -4300,6 +4835,8 @@ if (
                             setMemberSearch(
                                 ""
                             );
+                            setAddMembersError("");
+                            setAddMembersNotice("");
                         }}
                         style={{
                             position:
@@ -4320,6 +4857,10 @@ if (
                         }}
                     >
                         <div
+                            className="cs-add-members-dialog"
+                            role="dialog"
+                            aria-modal="true"
+                            aria-labelledby="add-members-title"
                             onClick={(e) =>
                                 e.stopPropagation()
                             }
@@ -4344,7 +4885,8 @@ if (
                                     "0 20px 50px rgba(0,0,0,0.25)"
                             }}
                         >
-                            <div
+                                <div
+                                    className="cs-add-members-header"
                                 style={{
                                     padding:
                                         "18px",
@@ -4360,6 +4902,7 @@ if (
                             >
                                 <div>
                                     <h2
+                                        id="add-members-title"
                                         style={{
                                             margin:
                                                 0
@@ -4369,6 +4912,7 @@ if (
                                     </h2>
 
                                     <small
+                                        className="cs-add-members-subtitle"
                                         style={{
                                             color:
                                                 "#667781"
@@ -4382,6 +4926,9 @@ if (
                                 </div>
 
                                 <button
+                                    type="button"
+                                    className="cs-add-members-close"
+                                    aria-label="Close Add Members"
                                     onClick={() => {
                                         setShowAddMembers(
                                             false
@@ -4410,12 +4957,15 @@ if (
                             </div>
 
                             <div
+                                className="cs-add-members-search"
                                 style={{
                                     padding:
                                         "14px"
                                 }}
                             >
                                 <input
+                                    id="group-member-search"
+                                    name="groupMemberSearch"
                                     type="search"
                                     placeholder="Search people..."
                                     value={
@@ -4446,6 +4996,7 @@ if (
                             </div>
 
                             <div
+                                className="cs-add-members-list"
                                 style={{
                                     flex:
                                         1,
@@ -4455,15 +5006,33 @@ if (
                                         "0 14px"
                                 }}
                             >
-                                {availableMembers.length ===
-                                0 ? (
+                                {memberDirectoryLoading ? (
+                                    <p className="cs-add-members-empty" role="status">Loading people…</p>
+                                ) : memberDirectoryError ? (
+                                    <div className="cs-add-members-empty" role="alert">
+                                        <p>{memberDirectoryError}</p>
+                                        <button type="button" onClick={async () => {
+                                            setMemberDirectoryLoading(true);
+                                            try {
+                                                const response = await axios.get(apiUrl("/users"));
+                                                setUsers(response.data.users);
+                                                setMemberDirectoryError("");
+                                            } catch (error) {
+                                                setMemberDirectoryError(error.response?.data?.message || "People could not be loaded.");
+                                            } finally {
+                                                setMemberDirectoryLoading(false);
+                                            }
+                                        }}>Try again</button>
+                                    </div>
+                                ) : availableMembers.length === 0 ? (
                                     <p
+                                        className="cs-add-members-empty"
                                         style={{
                                             color:
                                                 "#667781"
                                         }}
                                     >
-                                        No users available.
+                                        {memberSearchValue ? "No people match this search." : "No people available to add."}
                                     </p>
                                 ) : (
                                     availableMembers.map(
@@ -4471,6 +5040,8 @@ if (
                                             user
                                         ) => (
                                             <label
+                                                className="cs-add-member-option"
+                                                data-selected={selectedMembers.includes(user._id)}
                                                 key={
                                                     user._id
                                                 }
@@ -4494,6 +5065,8 @@ if (
                                                 }}
                                             >
                                                 <input
+                                                    id={`member-${user._id}`}
+                                                    name="groupMember"
                                                     type="checkbox"
                                                     checked={selectedMembers.includes(
                                                         user._id
@@ -4532,7 +5105,7 @@ if (
                                                     👤
                                                 </div>
 
-                                                <strong>
+                                                <strong className="cs-add-member-name">
                                                     {
                                                         user.username
                                                     }
@@ -4544,6 +5117,7 @@ if (
                             </div>
 
                             <div
+                                className="cs-add-members-footer"
                                 style={{
                                     padding:
                                         "15px",
@@ -4558,6 +5132,7 @@ if (
                                 }}
                             >
                                 <span
+                                    className="cs-add-members-count"
                                     style={{
                                         color:
                                             "#667781"
@@ -4570,12 +5145,26 @@ if (
                                 </span>
 
                                 <button
+                                    type="button"
+                                    className="cs-add-members-cancel"
+                                    onClick={() => {
+                                        setShowAddMembers(false);
+                                        setSelectedMembers([]);
+                                        setMemberSearch("");
+                                    }}
+                                >
+                                    Cancel
+                                </button>
+
+                                <button
+                                    type="button"
+                                    className="cs-add-members-submit"
                                     onClick={
                                         addMembersToGroup
                                     }
                                     disabled={
                                         selectedMembers.length ===
-                                        0
+                                        0 || addingMembers
                                     }
                                     style={{
                                         border:
@@ -4584,7 +5173,7 @@ if (
                                             selectedMembers.length ===
                                             0
                                                 ? "#cbd5e1"
-                                                : "#25d366",
+                                                : "var(--cs-brand)",
                                         color:
                                             "#ffffff",
                                         padding:
@@ -4600,9 +5189,14 @@ if (
                                             "bold"
                                     }}
                                 >
-                                    Add selected
+                                    {addingMembers ? "Adding…" : "Add selected"}
                                 </button>
                             </div>
+                            {(addMembersError || addMembersNotice) && (
+                                <p className={addMembersError ? "cs-add-members-error" : "cs-add-members-success"} role={addMembersError ? "alert" : "status"}>
+                                    {addMembersError || addMembersNotice}
+                                </p>
+                            )}
                         </div>
                     </div>
                 )}
@@ -4691,6 +5285,8 @@ if (
 
                         <div style={{ padding: "16px" }}>
                             <input
+                                id="new-group-name"
+                                name="groupName"
                                 type="text"
                                 aria-label="Group name"
                                 placeholder="Enter group name"
@@ -4758,6 +5354,8 @@ if (
                                                 }}
                                             >
                                                 <input
+                                                    id={`new-group-member-${user._id}`}
+                                                    name="newGroupMember"
                                                     type="checkbox"
                                                     checked={selected}
                                                     onChange={() =>
@@ -4768,7 +5366,7 @@ if (
                                                     style={{
                                                         width: "18px",
                                                         height: "18px",
-                                                        accentColor: "#128c7e"
+                                                        accentColor: "var(--cs-brand)"
                                                     }}
                                                 />
 
@@ -4790,15 +5388,6 @@ if (
 
                                                 <div style={{ flex: 1, minWidth: 0 }}>
                                                     <strong>{user.username}</strong>
-                                                    <div
-                                                        style={{
-                                                            fontSize: "12px",
-                                                            color: "#667781",
-                                                            overflowWrap: "anywhere"
-                                                        }}
-                                                    >
-                                                        {user.email}
-                                                    </div>
                                                 </div>
 
                                             </label>
@@ -4834,7 +5423,7 @@ if (
                                         !newGroupName.trim() ||
                                         newGroupMembers.length === 0
                                             ? "#cbd5e1"
-                                            : "#25d366",
+                                            : "var(--cs-brand)",
                                     color: "#ffffff",
                                     padding: "11px 22px",
                                     borderRadius: "22px",

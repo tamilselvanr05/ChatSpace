@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import { Settings } from "lucide-react";
+import { apiUrl } from "./config";
+import { ProtectedImage } from "./components/ProtectedMedia";
 
 function Profile() {
     const navigate = useNavigate();
@@ -23,7 +25,7 @@ function Profile() {
         try {
             const response =
                 await axios.get(
-                    "http://localhost:3030/profile"
+                    apiUrl("/profile")
                 );
 
             const profile =
@@ -37,7 +39,7 @@ function Profile() {
 
             setAbout(
                 profile.about ||
-                "Hey there! I am using Chat App."
+                ""
             );
 
             setProfilePhoto(
@@ -100,7 +102,7 @@ function Profile() {
 
             const response =
                 await axios.put(
-                    "http://localhost:3030/profile/photo",
+                    apiUrl("/profile/photo"),
                     formData
                 );
 
@@ -127,7 +129,7 @@ function Profile() {
 
         try {
             await axios.put(
-                "http://localhost:3030/profile",
+                apiUrl("/profile"),
                 {
                     username:
                         newUsername,
@@ -176,27 +178,26 @@ function Profile() {
 
     return (
 
-        <div
+            <main
+                className="cs-profile-page"
             style={{
                 width: "100%",
-                minHeight: "100vh",
-                background: "#f0f2f5"
+                minHeight: "100vh"
             }}
         >
 
             <div
+                className="cs-profile-card"
                 style={{
                     maxWidth: "500px",
                     margin: "0 auto",
-                    background: "white",
                     minHeight: "100vh"
                 }}
             >
 
                 <div
+                    className="cs-profile-header"
                     style={{
-                        background: "#075e54",
-                        color: "white",
                         padding: "18px",
                         fontSize: "20px",
                         fontWeight: "600",
@@ -244,6 +245,7 @@ function Profile() {
                 </div>
 
                 <div
+                    className="cs-profile-photo-section"
                     style={{
                         display: "flex",
                         flexDirection: "column",
@@ -260,8 +262,9 @@ function Profile() {
 
                         {profilePhoto ? (
 
-                            <img
-                                src={`http://localhost:3030${profilePhoto}`}
+                            <ProtectedImage
+                                path={`/media/profiles/${user._id}`}
+                                refreshKey={profilePhoto}
                                 alt="Profile"
                                 style={{
                                     width: "140px",
@@ -300,7 +303,7 @@ function Profile() {
                             marginTop: "12px",
                             border: "none",
                             background: "transparent",
-                            color: "#075e54",
+                            color: "var(--cs-brand)",
                             fontSize: "15px",
                             cursor: "pointer"
                         }}
@@ -309,6 +312,8 @@ function Profile() {
                     </button>
 
                     <input
+                        id="profile-photo-upload"
+                        name="profilePhoto"
                         ref={fileInputRef}
                         type="file"
                         accept="image/*"
@@ -323,40 +328,33 @@ function Profile() {
                 </div>
 
                 <div
+                    className="cs-profile-details"
                     style={{
                         padding: "0 25px"
                     }}
                 >
 
-                    <p
-                        style={{
-                            color: "#667781",
-                            fontSize: "14px"
-                        }}
-                    >
+                    <p className="cs-profile-label">
                         Your name
                     </p>
 
                     {editing ? (
 
                         <input
+                            id="profile-username"
+                            name="username"
                             value={newUsername}
                             onChange={(e) =>
                                 setNewUsername(
                                     e.target.value
                                 )
                             }
-                            style={{
-                                width: "100%",
-                                padding: "12px",
-                                fontSize: "16px",
-                                boxSizing: "border-box"
-                            }}
+                            className="cs-profile-input"
                         />
 
                     ) : (
 
-                        <h3>
+                        <h3 className="cs-profile-value cs-profile-name">
                             {user.username}
                         </h3>
 
@@ -364,35 +362,27 @@ function Profile() {
 
                     <hr />
 
-                    <p
-                        style={{
-                            color: "#667781",
-                            fontSize: "14px"
-                        }}
-                    >
+                    <p className="cs-profile-label">
                         About
                     </p>
 
                     {editing ? (
 
                         <input
+                            id="profile-about"
+                            name="about"
                             value={about}
                             onChange={(e) =>
                                 setAbout(
                                     e.target.value
                                 )
                             }
-                            style={{
-                                width: "100%",
-                                padding: "12px",
-                                fontSize: "16px",
-                                boxSizing: "border-box"
-                            }}
+                            className="cs-profile-input"
                         />
 
                     ) : (
 
-                        <p>
+                        <p className="cs-profile-value cs-profile-about">
                             {about}
                         </p>
 
@@ -400,16 +390,11 @@ function Profile() {
 
                     <hr />
 
-                    <p
-                        style={{
-                            color: "#667781",
-                            fontSize: "14px"
-                        }}
-                    >
+                    <p className="cs-profile-label">
                         Email
                     </p>
 
-                    <p>
+                    <p className="cs-profile-value cs-profile-email">
                         {user.email}
                     </p>
 
@@ -418,6 +403,7 @@ function Profile() {
                     {editing ? (
 
                         <button
+                            className="cs-profile-action"
                             onClick={
                                 updateProfile
                             }
@@ -428,8 +414,8 @@ function Profile() {
                                 borderRadius:
                                     "8px",
                                 background:
-                                    "#075e54",
-                                color: "white",
+                                    "var(--cs-brand)",
+                                color: "#fff",
                                 cursor:
                                     "pointer"
                             }}
@@ -440,6 +426,7 @@ function Profile() {
                     ) : (
 
                         <button
+                            className="cs-profile-action"
                             onClick={() =>
                                 setEditing(true)
                             }
@@ -450,8 +437,8 @@ function Profile() {
                                 borderRadius:
                                     "8px",
                                 background:
-                                    "#075e54",
-                                color: "white",
+                                    "var(--cs-brand)",
+                                color: "#fff",
                                 cursor:
                                     "pointer"
                             }}
@@ -465,7 +452,7 @@ function Profile() {
 
             </div>
 
-        </div>
+        </main>
 
     );
 

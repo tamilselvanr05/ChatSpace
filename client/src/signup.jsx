@@ -3,6 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import { createUserWithEmailAndPassword, sendEmailVerification, signOut, updateProfile } from "firebase/auth";
 import axios from "axios";
 import { auth, authReady } from "./firebase";
+import ChatSpaceLogo from "./components/ChatSpaceLogo";
+import { apiUrl } from "./config";
 
 function Signup() {
     const navigate = useNavigate();
@@ -46,7 +48,7 @@ function Signup() {
 
             await authReady;
             const username = form.username.trim();
-            const availability = await axios.post("http://localhost:3030/username-availability", {
+            const availability = await axios.post(apiUrl("/username-availability"), {
                 username
             });
             if (!availability.data.available) {
@@ -57,7 +59,7 @@ function Signup() {
             const credential = await createUserWithEmailAndPassword(auth, form.email.trim(), form.password);
             await updateProfile(credential.user, { displayName: username });
             const token = await credential.user.getIdToken(true);
-            await axios.post("http://localhost:3030/signup", {}, {
+            await axios.post(apiUrl("/signup"), {}, {
                 headers: { Authorization: `Bearer ${token}` },
                 useProvidedAuthToken: true
             });
@@ -95,10 +97,10 @@ function Signup() {
     };
 
     return (
-        <div style={styles.page}>
+        <div className="signup-page" style={styles.page}>
             <div style={styles.card}>
 
-                <div style={styles.logo}>C</div>
+                <ChatSpaceLogo className="signup-logo" />
 
                 <h1 style={styles.title}>Join ChatSpace</h1>
 
@@ -106,7 +108,7 @@ function Signup() {
                     Create your account and start connecting.
                 </p>
 
-                <form onSubmit={handleSubmit}>
+                <form className="signup-form" onSubmit={handleSubmit}>
 
                     <label style={styles.label}>
                         Username
@@ -218,6 +220,7 @@ function Signup() {
                             ...styles.button,
                             opacity: loading ? 0.7 : 1
                         }}
+                        className="signup-submit"
                     >
                         {loading
                             ? "Creating account..."
@@ -250,9 +253,8 @@ const styles = {
         justifyContent: "center",
         padding: "24px",
         boxSizing: "border-box",
-        background:
-            "linear-gradient(135deg, #eef2ff, #f8faff 55%, #e9e7ff)",
-        fontFamily: "Inter, Arial, sans-serif"
+        background: "var(--cs-auth-bg)",
+        fontFamily: "'DM Sans', Arial, sans-serif"
     },
 
     card: {
@@ -263,23 +265,7 @@ const styles = {
         background: "#ffffff",
         border: "1px solid #e7e8f0",
         borderRadius: "22px",
-        boxShadow:
-            "0 20px 60px rgba(45, 42, 100, 0.10)"
-    },
-
-    logo: {
-        width: "52px",
-        height: "52px",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        borderRadius: "16px",
-        background:
-            "linear-gradient(135deg, #6366f1, #8b5cf6)",
-        color: "#ffffff",
-        fontSize: "27px",
-        fontWeight: "800",
-        marginBottom: "20px"
+        boxShadow: "0 24px 80px rgba(45, 34, 55, 0.10)"
     },
 
     title: {
@@ -338,7 +324,7 @@ const styles = {
         right: "10px",
         border: "none",
         background: "transparent",
-        color: "#635bdb",
+        color: "var(--cs-brand)",
         fontSize: "13px",
         fontWeight: "700",
         cursor: "pointer",
@@ -351,8 +337,7 @@ const styles = {
         padding: "14px",
         border: "none",
         borderRadius: "10px",
-        background:
-            "linear-gradient(135deg, #6366f1, #7c3aed)",
+        background: "var(--cs-brand)",
         color: "#ffffff",
         fontSize: "15px",
         fontWeight: "700",
@@ -373,7 +358,7 @@ const styles = {
     },
 
     link: {
-        color: "#635bdb",
+        color: "var(--cs-brand)",
         fontWeight: "700",
         textDecoration: "none"
     }

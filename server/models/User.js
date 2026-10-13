@@ -54,6 +54,11 @@ const userSchema = new mongoose.Schema({
         default: false
     },
 
+    readReceiptsEnabled: {
+        type: Boolean,
+        default: true
+    },
+
     about: {
     type: String,
     default: "Hey there! I am using ChatSpace.",

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import socket from "../socket";
+import { API_BASE_URL } from "../config";
 
-const API = "http://localhost:3030";
+const API = API_BASE_URL;
 const blankForm = { title: "", description: "", date: "", time: "", location: "" };
 
 function localDateTime(value) {
@@ -121,11 +122,11 @@ export default function GroupEvents({ group, userId }) {
         <h3>Group events</h3>
         <form onSubmit={saveEvent} className="cs-event-form">
             <strong>{editingId ? "Edit event" : "Create event"}</strong>
-            <input aria-label="Event title" placeholder="Event title" maxLength={120} required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-            <textarea aria-label="Event description" placeholder="Description" maxLength={2000} rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
-            <label>Date<input aria-label="Event date" type="date" required value={form.date} onChange={(e) => { setForm({ ...form, date: e.target.value }); e.currentTarget.blur(); }} /></label>
-            <label>Time<input aria-label="Event time" type="time" required value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></label>
-            <input aria-label="Location" placeholder="Location (optional)" maxLength={200} value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} />
+            <input id="event-title" name="title" aria-label="Event title" placeholder="Event title" maxLength={120} required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+            <textarea id="event-description" name="description" aria-label="Event description" placeholder="Description" maxLength={2000} rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+            <label>Date<input id="event-date" name="date" aria-label="Event date" type="date" required value={form.date} onChange={(e) => { setForm({ ...form, date: e.target.value }); e.currentTarget.blur(); }} /></label>
+            <label>Time<input id="event-time" name="time" aria-label="Event time" type="time" required value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></label>
+            <input id="event-location" name="location" aria-label="Location" placeholder="Location (optional)" maxLength={200} value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} />
             <div className="cs-event-actions"><button type="submit" disabled={saving}>{saving ? "Saving…" : editingId ? "Save changes" : "Create event"}</button>{editingId && <button type="button" onClick={() => { setEditingId(null); setForm(blankForm); }}>Discard</button>}</div>
         </form>
         {error && <p role="alert" className="cs-event-error">{error}</p>}
