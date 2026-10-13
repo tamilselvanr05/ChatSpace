@@ -11,6 +11,7 @@ import PhotoViewer from "./components/PhotoViewer";
 import { ProtectedAudio, ProtectedDownload, ProtectedImage } from "./components/ProtectedMedia";
 import GroupEvents from "./components/GroupEvents";
 import ChatSpaceLogo from "./components/ChatSpaceLogo";
+import ChatSummaryDialog from "./components/ChatSummaryDialog";
 import {
     ArrowLeft,
     ChevronRight,
@@ -22,6 +23,7 @@ import {
     LockKeyhole,
     Search,
     Send,
+    Sparkles,
     Square,
     Settings,
     UserRound,
@@ -98,6 +100,7 @@ function App() {
     const [memberDirectoryLoading, setMemberDirectoryLoading] = useState(true);
     const [memberDirectoryError, setMemberDirectoryError] = useState("");
     const [selectedUser, setSelectedUser] = useState(null);
+    const [showChatSummary, setShowChatSummary] = useState(false);
     const [messages, setMessages] = useState([]);
     const [callHistory, setCallHistory] = useState([]);
     const [photoViewerMessageId, setPhotoViewerMessageId] = useState(null);
@@ -2638,6 +2641,14 @@ if (
                             </button>
                         ))}
                     </nav>
+
+                    <button
+                        type="button"
+                        className="cs-summary-sidebar-trigger"
+                        onClick={() => setShowChatSummary(true)}
+                    >
+                        <Sparkles size={15} /> Summarize text
+                    </button>
                 </div>
 
                 <div
@@ -3109,6 +3120,14 @@ if (
                             <div className="cs-chat-actions">
                                 <button
                                     type="button"
+                                    aria-label="Summarize chat"
+                                    title="Summarize chat"
+                                    onClick={() => setShowChatSummary(true)}
+                                >
+                                    <Sparkles size={18} />
+                                </button>
+                                <button
+                                    type="button"
                                     aria-label="Search messages"
                                     title="Search messages"
                                     onClick={toggleMessageSearch}
@@ -3204,6 +3223,14 @@ if (
 </button>
 
                             <div className="cs-chat-actions">
+                                {!isSelfChat && <button
+                                    type="button"
+                                    aria-label="Summarize chat"
+                                    title="Summarize chat"
+                                    onClick={() => setShowChatSummary(true)}
+                                >
+                                    <Sparkles size={18} />
+                                </button>}
                                 <button
                                     type="button"
                                     aria-label="Search messages"
@@ -5442,6 +5469,13 @@ if (
                 </div>
             )}
         </div>
+        {showChatSummary && (
+            <ChatSummaryDialog
+                conversationType={selectedGroup ? "group" : selectedUser && !isSelfChat ? "private" : null}
+                conversationId={selectedGroup?._id || (isSelfChat ? null : selectedUser?._id)}
+                onClose={() => setShowChatSummary(false)}
+            />
+        )}
         {reportDraft && (
             <div className="cs-report-backdrop" role="presentation" onMouseDown={(event) => {
                 if (event.target === event.currentTarget) setReportDraft(null);
