@@ -12,6 +12,9 @@ function CallOverlay({
     localStream,
     remoteStream,
     callError,
+    canFallbackToAudio,
+    onRetryVideo,
+    onAudioFallback,
     onAccept,
     onReject,
     onEnd
@@ -59,6 +62,12 @@ function CallOverlay({
             {callError && (
                 <div className="cs-call-error" role="alert">
                     {callError}
+                    {canFallbackToAudio && (
+                        <div className="cs-call-error-actions">
+                            <button type="button" onClick={onRetryVideo}>Retry video</button>
+                            <button type="button" onClick={onAudioFallback}>Start audio call</button>
+                        </div>
+                    )}
                 </div>
             )}
 

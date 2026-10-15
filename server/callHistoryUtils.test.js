@@ -4,6 +4,7 @@ const {
     buildCallHistoryQuery,
     canViewCallHistory,
     finalizeCallRecord,
+    finalizeUnansweredCall,
     resolveCallFinalFields
 } = require("./callHistoryUtils");
 
@@ -56,4 +57,26 @@ test("only one concurrent finalization changes a pending call", async () => {
     ]);
     assert.equal(results.filter(Boolean).length, 1);
     assert.equal(record.status, "rejected");
+});
+
+test("unanswered timeout marks only pending calls with no connection as missed", async () => {
+    const records = [
+        { callId: "ringing", status: "pending", connectedAt: null },
+        { callId: "connected", status: "pending", connectedAt: new Date(500) }
+    ];
+    const CallHistory = {
+        async findOneAndUpdate(filter, update) {
+            const record = records.find((item) => item.callId === filter.callId && item.status === filter.status && item.connectedAt === filter.connectedAt);
+            if (!record) return null;
+            Object.assign(record, update.$set);
+            return { ...record };
+        }
+    };
+    const endedAt = new Date(10_000);
+    const timedOut = await finalizeUnansweredCall(CallHistory, "ringing", endedAt);
+    assert.equal(timedOut.status, "missed");
+    assert.equal(timedOut.durationSeconds, 0);
+    assert.equal(timedOut.endedAt, endedAt);
+    assert.equal(await finalizeUnansweredCall(CallHistory, "ringing", endedAt), null);
+    assert.equal(await finalizeUnansweredCall(CallHistory, "connected", endedAt), null);
 });

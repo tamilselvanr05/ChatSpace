@@ -64,9 +64,18 @@ async function finalizeCallRecord(CallHistory, callId, reason, actorId, endedAt 
     return null;
 }
 
+async function finalizeUnansweredCall(CallHistory, callId, endedAt = new Date()) {
+    return CallHistory.findOneAndUpdate(
+        { callId, status: "pending", connectedAt: null },
+        { $set: { status: "missed", endedAt, durationSeconds: 0 } },
+        { new: true }
+    );
+}
+
 module.exports = {
     buildCallHistoryQuery,
     canViewCallHistory,
     finalizeCallRecord,
+    finalizeUnansweredCall,
     resolveCallFinalFields
 };

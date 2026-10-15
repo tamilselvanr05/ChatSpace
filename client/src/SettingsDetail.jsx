@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { apiUrl } from "./config";
+import { isNotificationSoundEnabled, playNotificationSound } from "./utils/notificationSound";
 
 function SettingsDetail() {
     const navigate = useNavigate();
@@ -39,22 +40,39 @@ function SettingsDetail() {
     const [messageFont, setMessageFont] = useState(
         localStorage.getItem("chatspace_message_font") || "default"
     );
-    const [readReceiptsEnabled, setReadReceiptsEnabled] = useState(true);
-    const [readReceiptLoading, setReadReceiptLoading] = useState(true);
-    const [readReceiptError, setReadReceiptError] = useState("");
+    const [privacySettings, setPrivacySettings] = useState({
+        showOnlineStatus: true,
+        readReceiptsEnabled: true,
+        typingIndicatorEnabled: true
+    });
+    const [privacyLoading, setPrivacyLoading] = useState(true);
+    const [privacyLoadError, setPrivacyLoadError] = useState(false);
+    const [privacySaving, setPrivacySaving] = useState(false);
+    const [privacyError, setPrivacyError] = useState("");
 
     useEffect(() => {
         if (location.pathname !== "/privacy") return;
         let active = true;
-        axios.get(apiUrl("/preferences/read-receipts"))
+        axios.get(apiUrl("/preferences/privacy"))
             .then((response) => {
-                if (active) setReadReceiptsEnabled(response.data.enabled !== false);
+                if (active) {
+                    setPrivacySettings({
+                        showOnlineStatus: response.data.showOnlineStatus !== false,
+                        readReceiptsEnabled: response.data.readReceiptsEnabled !== false,
+                        typingIndicatorEnabled: response.data.typingIndicatorEnabled !== false
+                    });
+                    setPrivacyLoadError(false);
+                    setPrivacyError("");
+                }
             })
             .catch((error) => {
-                if (active) setReadReceiptError(error.response?.data?.message || "Read receipt settings could not be loaded.");
+                if (active) {
+                    setPrivacyLoadError(true);
+                    setPrivacyError(error.response?.data?.message || "Privacy settings could not be loaded.");
+                }
             })
             .finally(() => {
-                if (active) setReadReceiptLoading(false);
+                if (active) setPrivacyLoading(false);
             });
         return () => { active = false; };
     }, [location.pathname]);
@@ -165,16 +183,19 @@ function SettingsDetail() {
         window.dispatchEvent(new Event("chatspace-settings-change"));
     };
 
-    const saveReadReceipts = async (value) => {
-        setReadReceiptError("");
-        setReadReceiptLoading(true);
+    const savePrivacyPreference = async (preference, value) => {
+        const previousValue = privacySettings[preference];
+        setPrivacySettings((previous) => ({ ...previous, [preference]: value }));
+        setPrivacyError("");
+        setPrivacySaving(true);
         try {
-            const response = await axios.patch(apiUrl("/preferences/read-receipts"), { enabled: value });
-            setReadReceiptsEnabled(response.data.enabled !== false);
+            const response = await axios.patch(apiUrl("/preferences/privacy"), { preference, enabled: value });
+            setPrivacySettings((previous) => ({ ...previous, [preference]: response.data.enabled !== false }));
         } catch (error) {
-            setReadReceiptError(error.response?.data?.message || "Read receipt settings could not be saved.");
+            setPrivacySettings((previous) => ({ ...previous, [preference]: previousValue }));
+            setPrivacyError(error.response?.data?.message || "Privacy setting could not be saved. The previous setting was restored.");
         } finally {
-            setReadReceiptLoading(false);
+            setPrivacySaving(false);
         }
     };
 
@@ -243,25 +264,27 @@ function SettingsDetail() {
                         <SettingToggle
                             title="Show online status"
                             description="Allow other users to see when you are online."
-                            checked={true}
-                            disabled={true}
+                            checked={privacySettings.showOnlineStatus}
+                            disabled={privacyLoading || privacySaving || privacyLoadError}
+                            onChange={(value) => savePrivacyPreference("showOnlineStatus", value)}
                         />
 
                         <SettingToggle
                             title="Read receipts"
                             description="Allow other members to see when you have read their messages. Delivery ticks are unchanged."
-                            checked={readReceiptsEnabled}
-                            disabled={readReceiptLoading}
-                            onChange={saveReadReceipts}
+                            checked={privacySettings.readReceiptsEnabled}
+                            disabled={privacyLoading || privacySaving || privacyLoadError}
+                            onChange={(value) => savePrivacyPreference("readReceiptsEnabled", value)}
                         />
-                        {readReceiptError && <p role="alert" className="cs-settings-error">{readReceiptError}</p>}
 
                         <SettingToggle
                             title="Typing indicator"
                             description="Show when you are typing a message."
-                            checked={true}
-                            disabled={true}
+                            checked={privacySettings.typingIndicatorEnabled}
+                            disabled={privacyLoading || privacySaving || privacyLoadError}
+                            onChange={(value) => savePrivacyPreference("typingIndicatorEnabled", value)}
                         />
+                        {privacyError && <p role="alert" className="cs-settings-error">{privacyError}</p>}
 
                     </div>
                 )}
@@ -396,44 +419,14 @@ function SettingsDetail() {
 <button
     type="button"
     className="cs-action-button"
+    disabled={!sound}
     onClick={() => {
-        const AudioContext =
-            window.AudioContext || window.webkitAudioContext;
+        if (!sound || !isNotificationSoundEnabled()) return;
+        const played = playNotificationSound();
 
-        if (!AudioContext) {
+        if (!played) {
             alert("Audio is not supported in this browser.");
-            return;
         }
-
-        const audioContext = new AudioContext();
-
-        audioContext.resume().then(() => {
-            const playTone = (frequency, delay, duration) => {
-                const oscillator = audioContext.createOscillator();
-                const gain = audioContext.createGain();
-                const start = audioContext.currentTime + delay;
-
-                oscillator.type = "sine";
-                oscillator.frequency.setValueAtTime(frequency, start);
-
-                gain.gain.setValueAtTime(0.001, start);
-                gain.gain.exponentialRampToValueAtTime(0.2, start + 0.015);
-                gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
-
-                oscillator.connect(gain);
-                gain.connect(audioContext.destination);
-
-                oscillator.start(start);
-                oscillator.stop(start + duration);
-            };
-
-            playTone(880, 0, 0.12);
-            playTone(1174.66, 0.14, 0.18);
-
-            setTimeout(() => audioContext.close(), 700);
-        }).catch((error) => {
-            console.error("Could not play test sound:", error);
-        });
     }}
 >
     Test notification sound

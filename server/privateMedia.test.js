@@ -223,3 +223,28 @@ test("authorized audio uses inline audio headers and supports seeking ranges", a
     assert.equal(response.headers.get("content-range"), "bytes 5-8/10");
     assert.equal(await response.text(), "5678");
 });
+
+test("video attachments remain protected and download as files with their extension", async (t) => {
+    const baseUrl = await makeMediaServer(t, {
+        message: mediaMessage({
+            fileUrl: "/uploads/clip.mp4",
+            fileName: "holiday clip.mp4",
+            fileType: "video/mp4",
+            messageType: "file"
+        }),
+        filename: "clip.mp4",
+        fileBytes: Buffer.from("video-data")
+    });
+    const denied = await fetch(`${baseUrl}/media/messages/${MESSAGE_ID}`, {
+        headers: { Authorization: "Bearer test-token", "X-Test-User": USER_C }
+    });
+    assert.equal(denied.status, 404);
+
+    const response = await fetch(`${baseUrl}/media/messages/${MESSAGE_ID}`, {
+        headers: { Authorization: "Bearer test-token", "X-Test-User": USER_B }
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/octet-stream");
+    assert.match(response.headers.get("content-disposition"), /^attachment;/);
+    assert.equal(await response.text(), "video-data");
+});

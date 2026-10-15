@@ -1,15 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import axios from "axios";
 import { apiUrl } from "../config";
-
-const safeImageTypes = new Set([
-    "image/avif",
-    "image/bmp",
-    "image/gif",
-    "image/jpeg",
-    "image/png",
-    "image/webp"
-]);
+import { useProtectedMedia } from "../hooks/useProtectedMedia";
 
 function safeDownloadName(value) {
     return [...String(value || "download")]
@@ -18,52 +10,7 @@ function safeDownloadName(value) {
         .join("");
 }
 
-function useProtectedMedia(path, refreshKey = "", mediaKind = "") {
-    const requestKey = `${path || ""}\u0000${refreshKey || ""}\u0000${mediaKind}`;
-    const [result, setResult] = useState(null);
-
-    useEffect(() => {
-        if (!path) return undefined;
-        const controller = new AbortController();
-        let active = true;
-        let objectUrl = null;
-
-        axios.get(apiUrl(path), {
-            responseType: "blob",
-            signal: controller.signal
-        }).then((response) => {
-            const contentType = (response.headers["content-type"] || response.data.type || "")
-                .split(";", 1)[0].trim().toLowerCase();
-            if ((mediaKind === "image" && !safeImageTypes.has(contentType)) ||
-                (mediaKind === "audio" && !contentType.startsWith("audio/"))) {
-                throw new Error("Unsupported media type");
-            }
-            objectUrl = URL.createObjectURL(response.data);
-            if (!active) {
-                URL.revokeObjectURL(objectUrl);
-                return;
-            }
-            setResult({ requestKey, url: objectUrl, error: null });
-        }).catch(() => {
-            if (active) setResult({ requestKey, url: null, error: "Media could not be loaded." });
-        });
-
-        return () => {
-            active = false;
-            controller.abort();
-            if (objectUrl) URL.revokeObjectURL(objectUrl);
-        };
-    }, [path, requestKey, mediaKind]);
-
-    const currentResult = result?.requestKey === requestKey ? result : null;
-    return {
-        url: currentResult?.url || null,
-        error: currentResult?.error || null,
-        loading: Boolean(path) && !currentResult
-    };
-}
-
-export function ProtectedImage({ path, refreshKey, alt = "", className, style, fallback = "Image unavailable", loadingLabel = "Loading media…" }) {
+export function ProtectedImage({ path, refreshKey, alt = "", className, style, onClick, fallback = "Image unavailable", loadingLabel = "Loading media…" }) {
     const { url, error, loading } = useProtectedMedia(path, refreshKey, "image");
     const [failedUrl, setFailedUrl] = useState(null);
 
@@ -78,7 +25,17 @@ export function ProtectedImage({ path, refreshKey, alt = "", className, style, f
             src={url}
             alt={alt}
             className={className}
-            style={style}
+            style={onClick ? { ...style, cursor: "pointer" } : style}
+            role={onClick ? "button" : undefined}
+            tabIndex={onClick ? 0 : undefined}
+            aria-label={onClick ? `View ${alt || "profile photo"}` : undefined}
+            onClick={onClick}
+            onKeyDown={onClick ? (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onClick(event);
+                }
+            } : undefined}
             onError={() => setFailedUrl(url)}
         />
     );

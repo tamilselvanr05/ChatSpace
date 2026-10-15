@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import { onAuthStateChanged, signOut } from "firebase/auth";
@@ -9,9 +10,11 @@ import CallOverlay from "./components/CallOverlay";
 import CallHistoryEntry from "./components/CallHistoryEntry";
 import PhotoViewer from "./components/PhotoViewer";
 import { ProtectedAudio, ProtectedDownload, ProtectedImage } from "./components/ProtectedMedia";
+import { useProtectedMedia } from "./hooks/useProtectedMedia";
 import GroupEvents from "./components/GroupEvents";
 import ChatSpaceLogo from "./components/ChatSpaceLogo";
 import ChatSummaryDialog from "./components/ChatSummaryDialog";
+import ConversationWallpaperDialog from "./components/ConversationWallpaperDialog";
 import {
     ArrowLeft,
     ChevronRight,
@@ -21,6 +24,7 @@ import {
     Mic,
     Phone,
     LockKeyhole,
+    Image as ImageIcon,
     Search,
     Send,
     Sparkles,
@@ -35,59 +39,19 @@ import {
 } from "lucide-react";
 import { detectSuspiciousMessage } from "./utils/scamDetector";
 import { splitMessageLinks } from "./utils/linkifyMessage";
+import { calculateMessageMenuPosition } from "./utils/messageMenuPosition";
+import { playIncomingNotificationSound } from "./utils/notificationSound";
+import { acquireCallMedia, getCallMediaErrorMessage } from "./utils/callMedia";
+import { getCallConnectionAction } from "./utils/callState";
 
 
-
-const playNotificationSound = () => {
-    if (localStorage.getItem("chatspace_notifications") === "false") {
-        return;
-    }
-
-    if (localStorage.getItem("chatspace_sound") === "false") {
-        return;
-    }
-
-    const AudioContext =
-        window.AudioContext || window.webkitAudioContext;
-
-    if (!AudioContext) return;
-
-    const audioContext = new AudioContext();
-
-    audioContext.resume().then(() => {
-        const playTone = (frequency, delay, duration) => {
-            const oscillator = audioContext.createOscillator();
-            const gain = audioContext.createGain();
-            const start = audioContext.currentTime + delay;
-
-            oscillator.type = "sine";
-            oscillator.frequency.setValueAtTime(frequency, start);
-
-            gain.gain.setValueAtTime(0.001, start);
-            gain.gain.exponentialRampToValueAtTime(0.2, start + 0.015);
-            gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
-
-            oscillator.connect(gain);
-            gain.connect(audioContext.destination);
-
-            oscillator.start(start);
-            oscillator.stop(start + duration);
-        };
-
-        playTone(880, 0, 0.12);
-        playTone(1174.66, 0.14, 0.18);
-
-        setTimeout(() => audioContext.close(), 700);
-    }).catch((error) => {
-        console.error("Notification sound error:", error);
-    });
-};
 function App() {
     const navigate = useNavigate();
 
     const [userId, setUserId] = useState("");
     const [profileUser, setProfileUser] = useState(null);
     const [users, setUsers] = useState([]);
+    const [directorySearchResults, setDirectorySearchResults] = useState([]);
     const [blockedUserIds, setBlockedUserIds] = useState([]);
     const [groups, setGroups] = useState([]);
     const [selectedGroup, setSelectedGroup] = useState(null);
@@ -104,6 +68,15 @@ function App() {
     const [messages, setMessages] = useState([]);
     const [callHistory, setCallHistory] = useState([]);
     const [photoViewerMessageId, setPhotoViewerMessageId] = useState(null);
+    const [photoViewerProfile, setPhotoViewerProfile] = useState(null);
+    const [showWallpaperDialog, setShowWallpaperDialog] = useState(false);
+    const [conversationWallpaper, setConversationWallpaper] = useState(null);
+    const [conversationWallpaperLoading, setConversationWallpaperLoading] = useState(false);
+    const { url: conversationWallpaperImage } = useProtectedMedia(
+        conversationWallpaper?.mediaPath,
+        conversationWallpaper?.version,
+        "image"
+    );
     const [message, setMessage] = useState("");
     const [messageSendError, setMessageSendError] = useState("");
     const [replyingTo, setReplyingTo] = useState(null);
@@ -116,7 +89,6 @@ function App() {
     const [messageNotification, setMessageNotification] = useState(null);
     const [messageSearch, setMessageSearch] = useState("");
     const [showMessageSearch, setShowMessageSearch] = useState(false);
-    const [showEmoji, setShowEmoji] = useState(false);
     const [showAttachment, setShowAttachment] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
     const [mediaRecorder, setMediaRecorder] = useState(null);
@@ -124,11 +96,68 @@ function App() {
     const [voicePreview, setVoicePreview] = useState(null);
     const [voiceSending, setVoiceSending] = useState(false);
     const [openMenu, setOpenMenu] = useState(null);
+    const [messageMenuPosition, setMessageMenuPosition] = useState(null);
+    const messageMenuRef = useRef(null);
+    const messageMenuTriggerRefs = useRef(new Map());
     const [openWarningId, setOpenWarningId] = useState(null);
     const [reportDraft, setReportDraft] = useState(null);
     const [reportReason, setReportReason] = useState("suspected_scam");
     const [reportDetails, setReportDetails] = useState("");
     const [reportStatus, setReportStatus] = useState({});
+    const reportRequestInFlightRef = useRef(false);
+
+    useLayoutEffect(() => {
+        if (!openMenu) {
+            setMessageMenuPosition(null);
+            return undefined;
+        }
+
+        const menu = messageMenuRef.current;
+        const trigger = messageMenuTriggerRefs.current.get(openMenu);
+        const container = trigger?.closest(".cs-message-list");
+        if (!menu || !trigger || !container) return undefined;
+
+        const positionMenu = () => {
+            const containerRect = container.getBoundingClientRect();
+            const triggerRect = trigger.getBoundingClientRect();
+            const position = calculateMessageMenuPosition({
+                containerRect,
+                triggerRect,
+                menuWidth: menu.scrollWidth,
+                menuHeight: menu.scrollHeight,
+                viewportWidth: window.innerWidth,
+                viewportHeight: window.innerHeight
+            });
+            if (!position) {
+                setOpenMenu(null);
+                return;
+            }
+            setMessageMenuPosition(position);
+        };
+
+        const onPointerDown = (event) => {
+            if (!menu.contains(event.target) && !trigger.contains(event.target)) setOpenMenu(null);
+        };
+        const onKeyDown = (event) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                setOpenMenu(null);
+                trigger.focus();
+            }
+        };
+
+        positionMenu();
+        container.addEventListener("scroll", positionMenu);
+        window.addEventListener("resize", positionMenu);
+        document.addEventListener("pointerdown", onPointerDown);
+        document.addEventListener("keydown", onKeyDown);
+        return () => {
+            container.removeEventListener("scroll", positionMenu);
+            window.removeEventListener("resize", positionMenu);
+            document.removeEventListener("pointerdown", onPointerDown);
+            document.removeEventListener("keydown", onKeyDown);
+        };
+    }, [openMenu]);
     const [showCreateGroup, setShowCreateGroup] = useState(false);
     const [newGroupName, setNewGroupName] = useState("");
     const [newGroupMembers, setNewGroupMembers] = useState([]);
@@ -152,6 +181,7 @@ function App() {
     const [localStream, setLocalStream] = useState(null);
     const [remoteStream, setRemoteStream] = useState(null);
     const [callError, setCallError] = useState("");
+    const [canFallbackToAudio, setCanFallbackToAudio] = useState(false);
 
     const messageEndRef = useRef(null);
     const peerConnectionRef = useRef(null);
@@ -161,6 +191,9 @@ function App() {
     const currentCallIdRef = useRef(null);
     const callGenerationRef = useRef(0);
     const callConnectionTimerRef = useRef(null);
+    const callSnapshotRef = useRef({ callState: null, incomingCall: null });
+    const callCleanupRef = useRef(null);
+    const callAttemptSequenceRef = useRef(0);
     const authRequestVersionRef = useRef(0);
     const typingStateRef = useRef({ key: null, isTyping: false });
     const typingTimersRef = useRef(new Map());
@@ -171,6 +204,8 @@ function App() {
     const voicePreviewRef = useRef(null);
     const mediaRecorderRef = useRef(null);
     const discardRecordingRef = useRef(false);
+
+    callSnapshotRef.current = { callState, incomingCall };
 
     useEffect(() => {
         activeTypingKeyRef.current = selectedGroup
@@ -246,12 +281,19 @@ useEffect(() => {
         });
     };
 
-    const closeCall = useCallback((notifyPeer = false) => {
-        const peerId =
-            callState?.peerId ||
-            incomingCall?.from;
-        const callId = callState?.callId || incomingCall?.callId || currentCallIdRef.current;
+    const closeCall = useCallback((source, notifyPeer = false) => {
+        const { callState: activeCall, incomingCall: pendingCall } = callSnapshotRef.current;
+        const peerId = activeCall?.peerId || pendingCall?.from;
+        const callId = activeCall?.callId || pendingCall?.callId || currentCallIdRef.current;
 
+        if (import.meta.env.DEV) console.info("[call diagnostic] terminating", {
+            callId,
+            source,
+            notifyPeer,
+            peerConnectionState: peerConnectionRef.current?.connectionState || null,
+            iceConnectionState: peerConnectionRef.current?.iceConnectionState || null,
+            signalingState: peerConnectionRef.current?.signalingState || null
+        });
         if (notifyPeer && peerId && callId) {
             socket.emit("call:end", {
                 from: userId,
@@ -276,7 +318,16 @@ useEffect(() => {
         setIncomingCall(null);
         setCallState(null);
         currentCallIdRef.current = null;
-    }, [callState, incomingCall, userId]);
+    }, [userId]);
+
+    callCleanupRef.current = closeCall;
+
+    useEffect(() => () => {
+        const { callState: activeCall, incomingCall: pendingCall } = callSnapshotRef.current;
+        if (activeCall || pendingCall || peerConnectionRef.current || localStreamRef.current) {
+            callCleanupRef.current?.("app-component-unmount", true);
+        }
+    }, []);
 
     const createPeerConnection = (peerId, callId = null) => {
         const peerConnection = new RTCPeerConnection({
@@ -309,8 +360,22 @@ useEffect(() => {
             setRemoteStream(event.streams[0]);
         };
 
+        const logCallStates = (eventName) => {
+            if (import.meta.env.DEV) console.info("[call diagnostic] state", {
+                callId: callId || currentCallIdRef.current,
+                eventName,
+                connectionState: peerConnection.connectionState,
+                iceConnectionState: peerConnection.iceConnectionState,
+                signalingState: peerConnection.signalingState
+            });
+        };
+        peerConnection.onsignalingstatechange = () => logCallStates("signalingstatechange");
+        peerConnection.oniceconnectionstatechange = () => logCallStates("iceconnectionstatechange");
+
         peerConnection.onconnectionstatechange = () => {
-            if (peerConnection.connectionState === "connected") {
+            logCallStates("connectionstatechange");
+            const connectionAction = getCallConnectionAction(peerConnection.connectionState);
+            if (connectionAction === "active") {
                 clearTimeout(callConnectionTimerRef.current);
                 callConnectionTimerRef.current = null;
                 setCallState((previousCall) =>
@@ -322,25 +387,27 @@ useEffect(() => {
                 if (activeCallId) {
                     socket.emit("call:connected", { to: peerId, callId: activeCallId });
                 }
-            } else if (peerConnection.connectionState === "failed") {
+            } else if (connectionAction === "terminate") {
                 const activeCallId = callId || currentCallIdRef.current;
+                if (import.meta.env.DEV) console.warn("[call diagnostic] WebRTC failed", { callId: activeCallId, iceConnectionState: peerConnection.iceConnectionState, signalingState: peerConnection.signalingState });
                 if (activeCallId) socket.emit("call:end", { to: peerId, callId: activeCallId });
-                closeCall(false);
-            } else if (peerConnection.connectionState === "disconnected") {
+                closeCall("webrtc-connection-failed");
+            } else if (connectionAction === "wait") {
                 clearTimeout(callConnectionTimerRef.current);
                 callConnectionTimerRef.current = setTimeout(() => {
                     if (peerConnection.connectionState !== "disconnected") return;
                     const activeCallId = callId || currentCallIdRef.current;
+                    if (import.meta.env.DEV) console.warn("[call diagnostic] disconnect grace expired", { callId: activeCallId, connectionState: peerConnection.connectionState, iceConnectionState: peerConnection.iceConnectionState });
                     if (activeCallId) socket.emit("call:end", { to: peerId, callId: activeCallId });
-                    closeCall(false);
-                }, 10000);
+                    closeCall("webrtc-disconnected-timeout");
+                }, 30000);
             }
         };
 
         return peerConnection;
     };
 
-    const addPendingIceCandidates = async (peerConnection) => {
+    const addPendingIceCandidates = useCallback(async (peerConnection) => {
         const candidates = pendingIceCandidatesRef.current;
         pendingIceCandidatesRef.current = [];
 
@@ -349,39 +416,49 @@ useEffect(() => {
                 new RTCIceCandidate(candidate)
             );
         }
-    };
+    }, []);
 
-    const startCall = async (callType) => {
-        if (!selectedUser || isSelectedUserBlocked || selectedUser.isDeleted || callState || incomingCall) {
+    const startCall = async (callType, targetUser = selectedUser) => {
+        if (!targetUser || blockedUserIds.includes(targetUser._id?.toString()) || targetUser.isDeleted || callState || incomingCall) {
             return;
         }
 
         const callGeneration = ++callGenerationRef.current;
+        const attemptId = `${Date.now()}-${++callAttemptSequenceRef.current}`;
         currentCallIdRef.current = null;
         setCallError("");
+        setCanFallbackToAudio(false);
         setCallState({
             status: "calling",
             callType,
-            peerId: selectedUser._id,
-            peerName: selectedUser.username
+            attemptId,
+            peerId: targetUser._id,
+            peerName: targetUser.username
         });
 
+        let stream;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: true,
-                video: callType === "video"
-            });
+            stream = await acquireCallMedia(callType);
+        } catch (error) {
+            if (callGeneration !== callGenerationRef.current) return;
+            console.warn("Call media unavailable:", error?.name || "UnknownError");
+            setCallError(getCallMediaErrorMessage(error, callType));
+            setCanFallbackToAudio(callType === "video" && error?.callDevice === "camera");
+            closeCall("outgoing-media-acquisition-failed");
+            return;
+        }
 
-            if (callGeneration !== callGenerationRef.current) {
-                stream.getTracks().forEach((track) => track.stop());
-                return;
-            }
+        if (callGeneration !== callGenerationRef.current) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+        }
 
-            localStreamRef.current = stream;
-            setLocalStream(stream);
+        localStreamRef.current = stream;
+        setLocalStream(stream);
 
+        try {
             const peerConnection = createPeerConnection(
-                selectedUser._id
+                targetUser._id
             );
 
             stream.getTracks().forEach((track) => {
@@ -395,19 +472,18 @@ useEffect(() => {
 
             socket.emit("call:offer", {
                 from: userId,
-                to: selectedUser._id,
+                to: targetUser._id,
                 fromName: profileUser?.username || "ChatSpace user",
                 callType,
+                attemptId,
                 offer: peerConnection.localDescription
             });
 
         } catch (error) {
             if (callGeneration !== callGenerationRef.current) return;
             console.error("Could not start call:", error);
-            setCallError(
-                "Microphone or camera permission is required to call."
-            );
-            closeCall(false);
+            setCallError("The call could not be started. Check your connection and try again.");
+            closeCall("outgoing-offer-creation-failed");
         }
     };
 
@@ -420,6 +496,7 @@ useEffect(() => {
         const callGeneration = ++callGenerationRef.current;
         currentCallIdRef.current = call.callId;
         setCallError("");
+        setCanFallbackToAudio(false);
         setCallState({
             status: "connecting",
             callType: call.callType,
@@ -427,20 +504,32 @@ useEffect(() => {
             peerName: call.fromName
         });
 
+        let stream;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: true,
-                video: call.callType === "video"
+            stream = await acquireCallMedia(call.callType);
+        } catch (error) {
+            if (callGeneration !== callGenerationRef.current) return;
+            console.warn("Call media unavailable while answering:", error?.name || "UnknownError");
+            setCallError(getCallMediaErrorMessage(error, call.callType, "answer"));
+            setCanFallbackToAudio(call.callType === "video" && error?.callDevice === "camera");
+            socket.emit("call:reject", {
+                from: userId,
+                to: call.from,
+                callId: call.callId
             });
+            closeCall("incoming-media-acquisition-failed");
+            return;
+        }
 
-            if (callGeneration !== callGenerationRef.current) {
-                stream.getTracks().forEach((track) => track.stop());
-                return;
-            }
+        if (callGeneration !== callGenerationRef.current) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+        }
 
-            localStreamRef.current = stream;
-            setLocalStream(stream);
+        localStreamRef.current = stream;
+        setLocalStream(stream);
 
+        try {
             const peerConnection = createPeerConnection(call.from, call.callId);
             await peerConnection.setRemoteDescription(
                 new RTCSessionDescription(call.offer)
@@ -468,15 +557,13 @@ useEffect(() => {
         } catch (error) {
             if (callGeneration !== callGenerationRef.current) return;
             console.error("Could not accept call:", error);
-            setCallError(
-                "Microphone or camera permission is required to answer."
-            );
+            setCallError("The call could not be answered. Check your connection and try again.");
             socket.emit("call:reject", {
                 from: userId,
                 to: call.from,
                 callId: call.callId
             });
-            closeCall(false);
+            closeCall("incoming-answer-creation-failed");
         }
     };
 
@@ -489,21 +576,22 @@ useEffect(() => {
             });
         }
 
-        closeCall(false);
+        closeCall("user-rejected-incoming-call");
     };
 
-    const emojis = [
-        "😀", "😂", "🤣", "😊", "😍", "😘",
-        "😎", "😢", "😭", "😡", "👍", "👎",
-        "❤️", "🔥", "🎉", "👏", "🙏", "💯",
-        "🥳", "😇", "🤔", "😴", "😮", "❤️"
-    ];
 
     useEffect(() => {
         let disposed = false;
 
         const handleConnect = () => {
             console.log("Connected:", socket.id);
+        };
+
+        const handleDisconnect = (reason) => {
+            if (import.meta.env.DEV) console.warn("[call diagnostic] socket disconnected", {
+                reason,
+                callId: callSnapshotRef.current.callState?.callId || callSnapshotRef.current.incomingCall?.callId || currentCallIdRef.current
+            });
         };
 
         const handleConnectError = (error) => {
@@ -522,6 +610,7 @@ useEffect(() => {
         };
 
         socket.on("connect", handleConnect);
+        socket.on("disconnect", handleDisconnect);
         socket.on("connect_error", handleConnectError);
 
         const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -552,20 +641,7 @@ useEffect(() => {
             setUnreadCounts({});
             setLastMessages({});
             setMessageNotification(null);
-            setIncomingCall(null);
-            peerConnectionRef.current?.close();
-            peerConnectionRef.current = null;
-            pendingIceCandidatesRef.current = [];
-            localStreamRef.current?.getTracks().forEach((track) => track.stop());
-            localStreamRef.current = null;
-            callGenerationRef.current += 1;
-            clearTimeout(callConnectionTimerRef.current);
-            callConnectionTimerRef.current = null;
-            pendingLocalIceCandidatesRef.current = [];
-            currentCallIdRef.current = null;
-            setLocalStream(null);
-            setRemoteStream(null);
-            setCallState(null);
+            callCleanupRef.current?.("auth-session-reset", false);
 
             if (!firebaseUser) {
                 if (!disposed) navigate("/");
@@ -615,17 +691,21 @@ useEffect(() => {
             unsubscribeAuth();
             socket.disconnect();
             socket.off("connect", handleConnect);
+            socket.off("disconnect", handleDisconnect);
             socket.off("connect_error", handleConnectError);
         };
     }, [navigate]);
 
     useEffect(() => {
         const handleCallCreated = (data) => {
+            const { callState: activeCall, incomingCall: pendingCall } = callSnapshotRef.current;
+            if (import.meta.env.DEV) console.info("[call diagnostic] socket call:created", { callId: data.callId, peerId: data.peerId, callState: activeCall?.status || null });
+            if (data.attemptId && activeCall?.attemptId !== data.attemptId) return;
             if (
-                callState?.status !== "calling" ||
-                callState?.peerId?.toString() !== data.peerId?.toString()
+                activeCall?.status !== "calling" ||
+                activeCall?.peerId?.toString() !== data.peerId?.toString()
             ) {
-                if (!callState && !incomingCall) {
+                if (!activeCall && !pendingCall) {
                     socket.emit("call:end", { to: data.peerId, callId: data.callId });
                 }
                 return;
@@ -647,7 +727,8 @@ useEffect(() => {
         };
 
         const handleCallOffer = (data) => {
-            if (callState || incomingCall) {
+            if (import.meta.env.DEV) console.info("[call diagnostic] socket call:offer", { callId: data.callId, from: data.from, callType: data.callType });
+            if (callSnapshotRef.current.callState || callSnapshotRef.current.incomingCall) {
                 socket.emit("call:busy", {
                     from: userId,
                     to: data.from,
@@ -668,13 +749,42 @@ useEffect(() => {
             });
         };
 
+        const handleCallOffline = (data) => {
+            const activeCall = callSnapshotRef.current.callState;
+            if (import.meta.env.DEV) console.warn("[call diagnostic] recipient offline", { callId: data.callId, attemptId: data.attemptId });
+            if (
+                activeCall?.status !== "calling" ||
+                activeCall.peerId?.toString() !== data.from?.toString() ||
+                (data.attemptId && activeCall.attemptId !== data.attemptId)
+            ) return;
+
+            currentCallIdRef.current = data.callId;
+            setCallError("This user is offline and cannot receive calls right now.");
+            closeCall("recipient-offline");
+        };
+
+        const handleCallTimeout = (data) => {
+            const activeCall = callSnapshotRef.current.callState;
+            if (import.meta.env.DEV) console.warn("[call diagnostic] invitation timed out", { callId: data.callId });
+            if (
+                activeCall?.callId !== data.callId ||
+                activeCall.peerId?.toString() !== data.from?.toString()
+            ) return;
+
+            const timeoutSeconds = Math.round((data.timeoutMs || 60_000) / 1000);
+            setCallError(`No answer or connection was established within ${timeoutSeconds} seconds.`);
+            closeCall("unanswered-invitation-timeout");
+        };
+
         const handleCallAnswer = async (data) => {
+            if (import.meta.env.DEV) console.info("[call diagnostic] socket call:answer", { callId: data.callId, from: data.from });
             const peerConnection = peerConnectionRef.current;
+            const activeCall = callSnapshotRef.current.callState;
 
             if (
                 !peerConnection ||
-                callState?.peerId?.toString() !== data.from?.toString() ||
-                callState?.callId !== data.callId
+                activeCall?.peerId?.toString() !== data.from?.toString() ||
+                activeCall?.callId !== data.callId
             ) {
                 return;
             }
@@ -692,13 +802,15 @@ useEffect(() => {
             } catch (error) {
                 console.error("Could not connect call:", error);
                 setCallError("Unable to connect this call.");
-                closeCall(false);
+                const activeCallId = currentCallIdRef.current;
+                if (activeCallId) socket.emit("call:end", { to: data.from, callId: activeCallId });
+                closeCall("remote-answer-application-failed");
             }
         };
 
         const handleCallIceCandidate = async (data) => {
-            const expectedPeer =
-                callState?.peerId || incomingCall?.from;
+            const { callState: activeCall, incomingCall: pendingCall } = callSnapshotRef.current;
+            const expectedPeer = activeCall?.peerId || pendingCall?.from;
 
             if (
                 expectedPeer?.toString() !==
@@ -727,41 +839,49 @@ useEffect(() => {
         };
 
         const handleCallReject = (data) => {
+            if (import.meta.env.DEV) console.warn("[call diagnostic] socket call:reject", { callId: data.callId, from: data.from });
+            const activeCall = callSnapshotRef.current.callState;
             if (
-                callState?.peerId?.toString() ===
+                activeCall?.peerId?.toString() ===
                     data.from?.toString() &&
-                callState?.callId === data.callId
+                activeCall?.callId === data.callId
             ) {
                 setCallError("The call was declined.");
-                closeCall(false);
+                closeCall("remote-participant-rejected");
             }
         };
 
         const handleCallBusy = (data) => {
+            if (import.meta.env.DEV) console.warn("[call diagnostic] socket call:busy", { callId: data.callId, from: data.from });
+            const activeCall = callSnapshotRef.current.callState;
             if (
-                callState?.peerId?.toString() ===
+                activeCall?.peerId?.toString() ===
                     data.from?.toString() &&
-                callState?.callId === data.callId
+                activeCall?.callId === data.callId
             ) {
                 setCallError("This person is on another call.");
-                closeCall(false);
+                closeCall("remote-participant-busy");
             }
         };
 
         const handleCallEnd = (data) => {
+            const { callState: activeCall, incomingCall: pendingCall } = callSnapshotRef.current;
+            if (import.meta.env.DEV) console.warn("[call diagnostic] socket call:end received", { callId: data.callId, from: data.from, activeCallId: activeCall?.callId || pendingCall?.callId || currentCallIdRef.current });
             if (
-                callState?.peerId?.toString() ===
+                activeCall?.peerId?.toString() ===
                     data.from?.toString() ||
-                incomingCall?.from?.toString() ===
+                pendingCall?.from?.toString() ===
                     data.from?.toString()
             ) {
-                if ((callState?.callId || incomingCall?.callId) !== data.callId) return;
-                closeCall(false);
+                if ((activeCall?.callId || pendingCall?.callId) !== data.callId) return;
+                closeCall("remote-call-end-event");
             }
         };
 
         socket.on("call:created", handleCallCreated);
         socket.on("call:offer", handleCallOffer);
+        socket.on("call:offline", handleCallOffline);
+        socket.on("call:timeout", handleCallTimeout);
         socket.on("call:answer", handleCallAnswer);
         socket.on("call:ice-candidate", handleCallIceCandidate);
         socket.on("call:reject", handleCallReject);
@@ -769,15 +889,21 @@ useEffect(() => {
         socket.on("call:end", handleCallEnd);
 
         return () => {
+            if (import.meta.env.DEV) console.info("[call diagnostic] signaling handlers detached", {
+                callId: callSnapshotRef.current.callState?.callId || callSnapshotRef.current.incomingCall?.callId || currentCallIdRef.current,
+                callStatus: callSnapshotRef.current.callState?.status || null
+            });
             socket.off("call:created", handleCallCreated);
             socket.off("call:offer", handleCallOffer);
+            socket.off("call:offline", handleCallOffline);
+            socket.off("call:timeout", handleCallTimeout);
             socket.off("call:answer", handleCallAnswer);
             socket.off("call:ice-candidate", handleCallIceCandidate);
             socket.off("call:reject", handleCallReject);
             socket.off("call:busy", handleCallBusy);
             socket.off("call:end", handleCallEnd);
         };
-    }, [userId, callState, incomingCall, closeCall]);
+    }, [userId, closeCall, addPendingIceCandidates]);
 
     useEffect(() => {
         const selectedPeerId = selectedUser?._id?.toString();
@@ -848,12 +974,15 @@ useEffect(() => {
         getUsers();
 
         const handleStatusChange = (data) => {
+            const visibleOnline = data.userId?.toString() === userId?.toString()
+                ? true
+                : data.isOnline;
             setUsers((previousUsers) =>
                 previousUsers.map((user) =>
                     user._id === data.userId
                         ? {
                             ...user,
-                            isOnline: data.isOnline
+                            isOnline: visibleOnline
                         }
                         : user
                 )
@@ -866,7 +995,7 @@ useEffect(() => {
                 ) {
                     return {
                         ...previousUser,
-                        isOnline: data.isOnline
+                        isOnline: visibleOnline
                     };
                 }
 
@@ -875,7 +1004,7 @@ useEffect(() => {
             const updateGroupMembers = (group) => ({
                 ...group,
                 members: group.members.map((member) => member._id?.toString() === data.userId?.toString()
-                    ? { ...member, isOnline: data.isOnline }
+                    ? { ...member, isOnline: visibleOnline }
                     : member)
             });
             setGroups((previousGroups) => previousGroups.map(updateGroupMembers));
@@ -887,14 +1016,83 @@ useEffect(() => {
             handleStatusChange
         );
 
+        const handleProfilePhotoUpdated = ({ userId: changedUserId, profilePhoto }) => {
+            const updatePhoto = (user) => user?._id?.toString() === changedUserId?.toString()
+                ? { ...user, profilePhoto }
+                : user;
+            setProfileUser(updatePhoto);
+            setSelectedUser(updatePhoto);
+            setUsers((previousUsers) => previousUsers.map(updatePhoto));
+            const updateGroup = (group) => group ? {
+                ...group,
+                members: group.members.map(updatePhoto)
+            } : group;
+            setGroups((previousGroups) => previousGroups.map(updateGroup));
+            setSelectedGroup(updateGroup);
+            setPhotoViewerProfile((previous) => previous?.userId?.toString() === changedUserId?.toString()
+                ? { ...previous, profilePhoto }
+                : previous);
+        };
+        socket.on("profilePhotoUpdated", handleProfilePhotoUpdated);
+
         return () => {
             active = false;
             socket.off(
                 "userStatusChanged",
                 handleStatusChange
             );
+            socket.off("profilePhotoUpdated", handleProfilePhotoUpdated);
         };
     }, [userId]);
+
+    useEffect(() => {
+        const query = search.trim();
+        if (!userId || !query || activeFilter === "groups") {
+            setDirectorySearchResults([]);
+            return undefined;
+        }
+
+        let active = true;
+        setDirectorySearchResults([]);
+        const timeoutId = window.setTimeout(() => {
+            axios.get(apiUrl("/users"), { params: { search: query } })
+                .then((response) => {
+                    if (active) setDirectorySearchResults(response.data.users || []);
+                })
+                .catch(() => {
+                    if (active) setDirectorySearchResults([]);
+                });
+        }, 180);
+
+        return () => {
+            active = false;
+            window.clearTimeout(timeoutId);
+        };
+    }, [search, userId, activeFilter]);
+
+    useEffect(() => {
+        const peerId = selectedUser?._id?.toString();
+        if (!userId || !peerId || peerId === userId.toString()) {
+            setConversationWallpaper(null);
+            setConversationWallpaperLoading(false);
+            return undefined;
+        }
+
+        let active = true;
+        setConversationWallpaper(null);
+        setConversationWallpaperLoading(true);
+        axios.get(apiUrl(`/conversations/${peerId}/wallpaper`))
+            .then(({ data }) => {
+                if (active && data.wallpaper) setConversationWallpaper({ peerId, ...data.wallpaper });
+            })
+            .catch(() => {
+                if (active) setConversationWallpaper(null);
+            })
+            .finally(() => {
+                if (active) setConversationWallpaperLoading(false);
+            });
+        return () => { active = false; };
+    }, [userId, selectedUser?._id]);
 
     useEffect(() => {
         if (!userId) return undefined;
@@ -991,7 +1189,7 @@ useEffect(() => {
     });
 
     if (sender !== currentUser) {
-        playNotificationSound();
+        playIncomingNotificationSound();
     }
 }
 
@@ -1107,7 +1305,7 @@ if (
     });
 
     
-    playNotificationSound();
+    playIncomingNotificationSound();
 }
 
             setMessages((previousMessages) => {
@@ -1356,11 +1554,13 @@ if (
         setShowMessageSearch(false);
         setReplyingTo(null);
         setIsTyping(false);
-        setShowEmoji(false);
         setShowAttachment(false);
         setOpenMenu(null);
 
         try {
+            if (user.isHiddenConversation) {
+                await axios.post(apiUrl(`/users/${user._id}/restore`));
+            }
             const response = await axios.get(
                 apiUrl(`/messages/${user._id}`)
             );
@@ -1442,7 +1642,6 @@ if (
         setShowMessageSearch(false);
         setReplyingTo(null);
         setIsTyping(false);
-        setShowEmoji(false);
         setShowAttachment(false);
         setOpenMenu(null);
 
@@ -1702,7 +1901,6 @@ if (
                 clearTypingForCurrentChat();
                 setMessage("");
                 setReplyingTo(null);
-                setShowEmoji(false);
             }
         );
     };
@@ -1731,7 +1929,6 @@ if (
 
         setMessage("");
         setReplyingTo(null);
-        setShowEmoji(false);
     };
 
     const handleSendMessage = () => {
@@ -1794,13 +1991,6 @@ if (
         );
 
         setOpenMenu(null);
-    };
-
-    const addEmoji = (emoji) => {
-        setMessage(
-            (previousMessage) =>
-                previousMessage + emoji
-        );
     };
 
     const handleAttachment = async (e) => {
@@ -1991,7 +2181,6 @@ if (
             setRecordingSeconds(0);
             setIsRecording(true);
             setShowAttachment(false);
-            setShowEmoji(false);
 
         } catch (error) {
             stream?.getTracks().forEach((track) => {
@@ -2103,8 +2292,12 @@ if (
     const searchValue =
         search.trim().toLowerCase();
 
+    const searchableUsers = searchValue
+        ? [...new Map([...users, ...directorySearchResults].map((user) => [user._id?.toString(), user])).values()]
+        : users;
+
     const filteredUsers =
-        users.filter(
+        searchableUsers.filter(
             (user) =>
                 user._id?.toString() !==
                 userId?.toString() &&
@@ -2160,6 +2353,21 @@ if (
         if (photoImages.some((image) => image._id === messageId)) {
             setPhotoViewerMessageId(messageId);
         }
+    };
+
+    const openProfilePhotoViewer = (user) => {
+        if (!user?.profilePhoto || !user?._id) return;
+        setPhotoViewerProfile({
+            userId: user._id,
+            username: user.username,
+            profilePhoto: user.profilePhoto
+        });
+    };
+
+    const handleConversationWallpaperUpdated = (wallpaper) => {
+        setConversationWallpaper(wallpaper && selectedUser
+            ? { peerId: selectedUser._id.toString(), ...wallpaper }
+            : null);
     };
 
     const memberSearchValue =
@@ -2245,8 +2453,16 @@ if (
         msg.senderId?.toString() ===
         userId?.toString();
 
+    const openMessageReport = (message) => {
+        setReportDraft(message);
+        setReportReason("suspected_scam");
+        setReportDetails("");
+        setOpenMenu(null);
+    };
+
     const submitMessageReport = async () => {
-        if (!reportDraft || !window.confirm("Submit this message report? Your report is private and will not be shown to the sender.")) return;
+        if (!reportDraft || reportRequestInFlightRef.current || reportStatus[reportDraft._id]?.success) return;
+        reportRequestInFlightRef.current = true;
         setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: true, message: "" } }));
         try {
             await axios.post(apiUrl(`/messages/${reportDraft._id}/report`), {
@@ -2254,10 +2470,11 @@ if (
                 details: reportDetails
             });
             setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: false, success: true, message: "Report submitted." } }));
-            setReportDraft(null);
             setReportDetails("");
         } catch (error) {
             setReportStatus((previous) => ({ ...previous, [reportDraft._id]: { loading: false, message: error.response?.data?.message || "Report could not be submitted. Try again." } }));
+        } finally {
+            reportRequestInFlightRef.current = false;
         }
     };
 
@@ -2346,6 +2563,11 @@ if (
                             path={`/media/profiles/${senderUser._id}`}
                             refreshKey={senderUser.profilePhoto}
                             alt=""
+                                        fallback="👤"
+                            onClick={(event) => {
+                                event.stopPropagation();
+                                openProfilePhotoViewer(senderUser);
+                            }}
                             style={{
                                 width: "100%",
                                 height: "100%",
@@ -2467,9 +2689,16 @@ if (
                 localStream={localStream}
                 remoteStream={remoteStream}
                 callError={callError}
+                canFallbackToAudio={canFallbackToAudio}
+                onRetryVideo={() => startCall("video", incomingCall
+                    ? { _id: incomingCall.from, username: incomingCall.fromName }
+                    : selectedUser)}
+                onAudioFallback={() => startCall("audio", incomingCall
+                    ? { _id: incomingCall.from, username: incomingCall.fromName }
+                    : selectedUser)}
                 onAccept={acceptCall}
                 onReject={rejectCall}
-                onEnd={() => closeCall(true)}
+                onEnd={() => closeCall("user-hangup-button", true)}
             />
 
             <PhotoViewer
@@ -2477,6 +2706,16 @@ if (
                 activeIndex={photoImages.findIndex((image) => image._id === photoViewerMessageId)}
                 onClose={() => setPhotoViewerMessageId(null)}
                 onNavigate={(index) => setPhotoViewerMessageId(photoImages[index]?._id || null)}
+            />
+            <PhotoViewer
+                images={photoViewerProfile ? [{
+                    _id: photoViewerProfile.userId,
+                    fileName: photoViewerProfile.username,
+                    mediaPath: `/media/profiles/${photoViewerProfile.userId}`,
+                    refreshKey: photoViewerProfile.profilePhoto
+                }] : []}
+                activeIndex={0}
+                onClose={() => setPhotoViewerProfile(null)}
             />
 
             <div
@@ -2529,9 +2768,10 @@ if (
                                         path={`/media/profiles/${profileUser._id}`}
                                         refreshKey={profileUser.profilePhoto}
                                         alt=""
+                                        fallback="👤"
                                     />
                                 ) : (
-                                    <UserRound size={18} />
+                                    <>👤</>
                                 )}
                             </button>
 
@@ -2559,7 +2799,7 @@ if (
                                         type="button"
                                         onClick={() => {
                                             if (callState) {
-                                                closeCall(true);
+                                                closeCall("user-logout", true);
                                             }
                                             socket.disconnect();
                                             signOut(auth);
@@ -2843,7 +3083,7 @@ if (
                                 overflow: "hidden"
                             }}>
                             {profileUser.profilePhoto ? (
-                                <ProtectedImage style={{ width: "100%", height: "100%", objectFit: "cover" }} path={`/media/profiles/${profileUser._id}`} refreshKey={profileUser.profilePhoto} alt="" />
+                                <ProtectedImage style={{ width: "100%", height: "100%", objectFit: "cover" }} path={`/media/profiles/${profileUser._id}`} refreshKey={profileUser.profilePhoto} alt="" fallback="👤" onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(profileUser); }} />
                             ) : (
                                 <>👤</>
                             )}
@@ -2904,25 +3144,21 @@ if (
                                         fontSize:
                                             "21px",
                                         position:
-                                            "relative"
+                                            "relative",
+                                        overflow: "hidden"
                                     }}
                                 >
-                                    👤
-
-                                    {user.isOnline && (
-                                        <span
-                                            style={{
-                                                position: "absolute",
-                                                right: "0",
-                                                bottom: "1px",
-                                                width: "12px",
-                                                height: "12px",
-                                                background: "#25d366",
-                                                border: "2px solid #ffffff",
-                                                borderRadius: "50%"
-                                            }}
+                                    {user.profilePhoto ? (
+                                        <ProtectedImage
+                                            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                            path={`/media/profiles/${user._id}`}
+                                            refreshKey={user.profilePhoto}
+                                            alt={`${user.username} profile photo`}
+                                            fallback="👤"
+                                            onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(user); }}
                                         />
-                                    )}
+                                    ) : <>👤</>}
+
                                 </div>
 
                                 <div
@@ -3195,10 +3431,20 @@ if (
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            fontSize: "21px"
+            fontSize: "21px",
+            overflow: "hidden"
         }}
     >
-        👤
+        {selectedUser.profilePhoto ? (
+            <ProtectedImage
+                path={`/media/profiles/${selectedUser._id}`}
+                refreshKey={selectedUser.profilePhoto}
+                alt={`${selectedUser.username} profile photo`}
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                fallback="👤"
+                onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(selectedUser); }}
+            />
+        ) : <>👤</>}
     </div>
 
     <div>
@@ -3223,6 +3469,15 @@ if (
 </button>
 
                             <div className="cs-chat-actions">
+                                {!isSelfChat && <button
+                                    type="button"
+                                    aria-label="Chat wallpaper"
+                                    title={conversationWallpaperLoading ? "Loading chat wallpaper" : "Chat wallpaper"}
+                                    onClick={() => setShowWallpaperDialog(true)}
+                                    disabled={conversationWallpaperLoading}
+                                >
+                                    <ImageIcon size={18} />
+                                </button>}
                                 {!isSelfChat && <button
                                     type="button"
                                     aria-label="Summarize chat"
@@ -3370,9 +3625,9 @@ if (
                                         }
                                     >
                                         {member.profilePhoto ? (
-                                            <ProtectedImage className="cs-group-member-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt="" />
+                                            <ProtectedImage className="cs-group-member-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt={`${member.username} profile photo`} fallback="👤" onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(member); }} />
                                         ) : (
-                                            <span className="cs-group-member-avatar cs-group-member-fallback" aria-hidden="true">{member.username?.slice(0, 1)?.toUpperCase() || <UserRound size={15} />}</span>
+                                            <span className="cs-group-member-avatar cs-group-member-fallback" aria-hidden="true">👤</span>
                                         )}
                                         <span className="cs-group-member-name">{member.username}</span>
                                         <span className="cs-group-member-status" data-online={Boolean(member.isOnline)}><i aria-hidden="true" />{member.isOnline ? "Online" : "Offline"}</span>
@@ -3392,11 +3647,11 @@ if (
                 <div
                     className="cs-message-list"
                     data-wallpaper={chatBackground}
+                    data-custom-wallpaper={Boolean(conversationWallpaperImage && conversationWallpaper?.peerId === selectedUser?._id?.toString())}
                     data-message-style={messageStyle}
                     data-message-font={messageFont}
                     onClick={() => {
                         setOpenMenu(null);
-                        setShowEmoji(false);
                         setShowAttachment(false);
                     }}
                     style={{
@@ -3404,7 +3659,10 @@ if (
                         overflowY:
                             "auto",
                         padding:
-                            "24px"
+                            "24px",
+                        "--cs-custom-wallpaper-image": conversationWallpaperImage && conversationWallpaper?.peerId === selectedUser?._id?.toString()
+                            ? `url("${conversationWallpaperImage}")`
+                            : "none"
                     }}
                 >
                     {!selectedUser &&
@@ -3756,6 +4014,14 @@ if (
                                                     </div>
 
                                                     <button
+                                                        type="button"
+                                                        aria-label="Message actions"
+                                                        aria-haspopup="menu"
+                                                        aria-expanded={openMenu === msg._id}
+                                                        ref={(element) => {
+                                                            if (element) messageMenuTriggerRefs.current.set(msg._id, element);
+                                                            else messageMenuTriggerRefs.current.delete(msg._id);
+                                                        }}
                                                         onClick={(
                                                             e
                                                         ) => {
@@ -3798,23 +4064,19 @@ if (
                                                             onClick={() => setOpenWarningId(openWarningId === msg._id ? null : msg._id)}
                                                         >
                                                             <AlertTriangle size={14} />
-                                                            <span>{warning.risk} risk pattern detected</span>
+                                                            <span>Potentially suspicious message</span>
                                                         </button>
                                                         {openWarningId === msg._id && (
                                                             <div className="cs-scam-warning-detail">
                                                                 <strong>Why this warning appeared</strong>
                                                                 <ul>{warning.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
-                                                                <p>This rule-based warning can make mistakes and cannot determine whether a message is safe or fraudulent.</p>
+                                                                <p>This automated warning is only a possible risk signal. It can be wrong and does not establish that the message or sender is fraudulent.</p>
                                                                 {reportStatus[msg._id]?.success ? (
                                                                     <div className="cs-report-success" role="status">{reportStatus[msg._id].message}</div>
                                                                 ) : (
                                                                     <>
                                                                         {reportStatus[msg._id]?.message && <div className="cs-report-error" role="alert">{reportStatus[msg._id].message}</div>}
-                                                                        <button type="button" className="cs-report-button" onClick={() => {
-                                                                            setReportDraft(msg);
-                                                                            setReportReason("suspected_scam");
-                                                                            setReportDetails("");
-                                                                        }}>Report message</button>
+                                                                        <button type="button" className="cs-report-button" onClick={() => openMessageReport(msg)}>Report message</button>
                                                                     </>
                                                                 )}
                                                             </div>
@@ -3865,7 +4127,7 @@ if (
                                                     {own && (
                                                         <span
                                                             className="cs-message-status"
-                                                            data-read={profileUser?.readReceiptsEnabled !== false && Boolean(msg.readBy?.length)}
+                                                            data-read={Boolean(msg.readBy?.length)}
                                                             style={{
                                                                 fontSize:
                                                                     "13px",
@@ -3882,21 +4144,25 @@ if (
                                             </div>
 
                                             {openMenu ===
-                                                msg._id && (
+                                                msg._id && createPortal(
                                                 <div
+                                                    className="cs-message-menu"
+                                                    ref={messageMenuRef}
+                                                    role="group"
+                                                    aria-label="Message actions"
                                                     onClick={(
                                                         e
                                                     ) =>
                                                         e.stopPropagation()
                                                     }
                                                     style={{
-                                                        position:
-                                                            "absolute",
-                                                        right: "0",
-                                                        top:
-                                                            "30px",
-                                                        width:
-                                                            "180px",
+                                                        position: "fixed",
+                                                        left: messageMenuPosition?.left ?? 0,
+                                                        top: messageMenuPosition?.top ?? 0,
+                                                        width: messageMenuPosition?.width ?? 180,
+                                                        maxHeight: messageMenuPosition?.maxHeight ?? "min(70vh, 520px)",
+                                                        overflowY: "auto",
+                                                        visibility: messageMenuPosition ? "visible" : "hidden",
                                                         background:
                                                             "#ffffff",
                                                         borderRadius:
@@ -3905,13 +4171,12 @@ if (
                                                             "0 4px 12px rgba(0, 0, 0, 0.18)",
                                                         padding:
                                                             "6px 0",
-                                                        overflow:
-                                                            "hidden",
                                                         zIndex:
                                                             1000
                                                     }}
                                                 >
                                                     <button
+                                                        className="cs-message-menu-item"
                                                         onClick={() => {
                                                             setReplyingTo({
                                                                 ...msg,
@@ -3943,6 +4208,7 @@ if (
                                                     </button>
 
                                                     <button
+                                                        className="cs-message-menu-item"
                                                         onClick={() => copyMessage(msg)}
                                                         style={{
                                                             display: "block",
@@ -3967,6 +4233,16 @@ if (
                                                     </button>
 
                                                     <button
+                                                        className="cs-message-menu-item"
+                                                        type="button"
+                                                        disabled={Boolean(reportStatus[msg._id]?.success)}
+                                                        onClick={() => openMessageReport(msg)}
+                                                    >
+                                                        {reportStatus[msg._id]?.success ? "Report submitted" : "Report message"}
+                                                    </button>
+
+                                                    <button
+                                                        className="cs-message-menu-item"
                                                         onClick={() => {
                                                             socket.emit(
                                                                 "starMessage",
@@ -4006,6 +4282,7 @@ if (
                                                     </button>
 
                                                     <button
+                                                        className="cs-message-menu-item cs-message-menu-danger"
                                                         onClick={() =>
                                                             deleteForMe(
                                                                 msg
@@ -4042,6 +4319,7 @@ if (
 
                                                     {own && (
                                                         <button
+                                                            className="cs-message-menu-item cs-message-menu-danger"
                                                             onClick={() =>
                                                                 deleteForEveryone(
                                                                     msg
@@ -4076,7 +4354,8 @@ if (
                                                             Delete for everyone
                                                         </button>
                                                     )}
-                                                </div>
+                                                </div>,
+                                                document.body
                                             )}
                                         </div>
                                     </div>
@@ -4170,76 +4449,6 @@ if (
                                 >
                                     ×
                                 </button>
-                            </div>
-                        )}
-
-                        {showEmoji && (
-                            <div
-                                style={{
-                                    position:
-                                        "absolute",
-                                    bottom:
-                                        "65px",
-                                    left:
-                                        "10px",
-                                    background:
-                                        "#ffffff",
-                                    borderRadius:
-                                        "12px",
-                                    padding:
-                                        "12px",
-                                    boxShadow:
-                                        "0 4px 20px rgba(0,0,0,0.2)",
-                                    width:
-                                        "280px",
-                                    zIndex:
-                                        100
-                                }}
-                            >
-                                <div
-                                    style={{
-                                        display:
-                                            "grid",
-                                        gridTemplateColumns:
-                                            "repeat(6, 1fr)",
-                                        gap:
-                                            "8px"
-                                    }}
-                                >
-                                    {emojis.map(
-                                        (
-                                            emoji,
-                                            index
-                                        ) => (
-                                            <button
-                                                key={
-                                                    index
-                                                }
-                                                onClick={() =>
-                                                    addEmoji(
-                                                        emoji
-                                                    )
-                                                }
-                                                style={{
-                                                    border:
-                                                        "none",
-                                                    background:
-                                                        "transparent",
-                                                    cursor:
-                                                        "pointer",
-                                                    fontSize:
-                                                        "24px",
-                                                    padding:
-                                                        "5px"
-                                                }}
-                                            >
-                                                {
-                                                    emoji
-                                                }
-                                            </button>
-                                        )
-                                    )}
-                                </div>
                             </div>
                         )}
 
@@ -4386,44 +4595,12 @@ if (
                         >
                             <button
                                 type="button"
-                                className="cs-emoji-button"
-                                aria-label="Choose emoji"
-                                onClick={() => {
-                                    setShowEmoji(
-                                        !showEmoji
-                                    );
-                                    setShowAttachment(
-                                        false
-                                    );
-                                }}
-                                style={{
-                                    border:
-                                        "none",
-                                    background:
-                                        "transparent",
-                                    cursor:
-                                        "pointer",
-                                    fontSize:
-                                        "25px",
-                                    padding:
-                                        "5px"
-                                }}
-                            >
-                                😊
-                            </button>
-
-                            <button
-                                type="button"
                                 className="cs-attach-button"
                                 aria-label="Attach files"
                                 aria-expanded={showAttachment}
-                                title="Attach files"
                                 onClick={() => {
                                     setShowAttachment(
                                         !showAttachment
-                                    );
-                                    setShowEmoji(
-                                        false
                                     );
                                 }}
                                 style={{
@@ -4446,6 +4623,10 @@ if (
                                 id="message-composer"
                                 name="message"
                                 type="text"
+                                autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="off"
+                                spellCheck={false}
                                 placeholder="Type a message"
                                 value={message}
                                 onChange={
@@ -4610,9 +4791,9 @@ if (
                     key={member._id}
                 >
                     {member.profilePhoto ? (
-                        <ProtectedImage className="cs-mini-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt="" />
+                        <ProtectedImage className="cs-mini-avatar" path={`/media/profiles/${member._id}`} refreshKey={member.profilePhoto} alt={`${member.username} profile photo`} fallback="👤" onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(member); }} />
                     ) : (
-                        <span className="cs-mini-avatar">{member.username?.slice(0, 1)?.toUpperCase() || <UserRound size={15} />}</span>
+                        <span className="cs-mini-avatar">👤</span>
                     )}
 
                     <span>{member.username}</span>
@@ -4640,10 +4821,12 @@ if (
                     path={`/media/profiles/${selectedUser._id}`}
                     refreshKey={selectedUser.profilePhoto}
                     alt={selectedUser.username}
+                    fallback="👤"
+                    onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(selectedUser); }}
                 />
             ) : (
                 <div className="cs-info-avatar">
-                    <UserRound size={34} />
+                    👤
                 </div>
             )}
 
@@ -5250,14 +5433,16 @@ if (
                 >
                     <div
                         role="dialog"
+                        className="cs-create-group-dialog"
                         aria-modal="true"
                         aria-labelledby="create-group-title"
                         onClick={(event) => event.stopPropagation()}
                         style={{
                             width: "100%",
                             maxWidth: "450px",
-                            maxHeight: "80vh",
-                            background: "#ffffff",
+                            maxHeight: "min(88vh, 700px)",
+                            background: "var(--cs-surface)",
+                            color: "var(--cs-text)",
                             borderRadius: "8px",
                             overflow: "hidden",
                             display: "flex",
@@ -5271,7 +5456,7 @@ if (
                                 display: "flex",
                                 justifyContent: "space-between",
                                 alignItems: "center",
-                                borderBottom: "1px solid #eee",
+                                borderBottom: "1px solid var(--cs-border)",
                                 gap: "12px"
                             }}
                         >
@@ -5282,7 +5467,7 @@ if (
                                 >
                                     Create Group
                                 </h2>
-                                <small style={{ color: "#667781" }}>
+                                <small style={{ color: "var(--cs-readable-muted, var(--cs-muted))" }}>
                                     Add people to your new group
                                 </small>
                             </div>
@@ -5297,7 +5482,8 @@ if (
                                 }}
                                 style={{
                                     border: "none",
-                                    background: "#f0f2f5",
+                                    color: "var(--cs-text)",
+                                    background: "var(--cs-surface-raised)",
                                     borderRadius: "50%",
                                     width: "36px",
                                     height: "36px",
@@ -5312,6 +5498,7 @@ if (
 
                         <div style={{ padding: "16px" }}>
                             <input
+                                className="cs-create-group-name"
                                 id="new-group-name"
                                 name="groupName"
                                 type="text"
@@ -5325,10 +5512,12 @@ if (
                                     width: "100%",
                                     boxSizing: "border-box",
                                     padding: "12px 15px",
-                                    border: "1px solid #d1d7db",
+                                    border: "1px solid var(--cs-border)",
                                     borderRadius: "8px",
                                     outline: "none",
-                                    fontSize: "15px"
+                                    fontSize: "15px",
+                                    color: "var(--cs-text)",
+                                    background: "var(--cs-surface)"
                                 }}
                             />
                         </div>
@@ -5336,7 +5525,7 @@ if (
                         <div
                             style={{
                                 padding: "0 16px 10px",
-                                color: "#667781",
+                                color: "var(--cs-readable-muted, var(--cs-muted))",
                                 fontWeight: "600"
                             }}
                         >
@@ -5351,7 +5540,7 @@ if (
                             }}
                         >
                             {users.length === 0 ? (
-                                <p style={{ color: "#667781" }}>
+                                <p style={{ color: "var(--cs-readable-muted, var(--cs-muted))" }}>
                                     No users available.
                                 </p>
                             ) : (
@@ -5376,8 +5565,9 @@ if (
                                                     borderRadius: "8px",
                                                     cursor: "pointer",
                                                     background: selected
-                                                        ? "#e7fce9"
-                                                        : "#ffffff"
+                                                        ? "var(--cs-primary-soft)"
+                                                        : "var(--cs-surface)",
+                                                    color: "var(--cs-text)"
                                                 }}
                                             >
                                                 <input
@@ -5403,7 +5593,8 @@ if (
                                                         height: "42px",
                                                         flex: "0 0 42px",
                                                         borderRadius: "50%",
-                                                        background: "#dfe5e7",
+                                                        color: "var(--cs-text)",
+                                                        background: "var(--cs-surface-raised)",
                                                         display: "flex",
                                                         alignItems: "center",
                                                         justifyContent: "center",
@@ -5426,14 +5617,14 @@ if (
                         <div
                             style={{
                                 padding: "15px 16px",
-                                borderTop: "1px solid #eee",
+                                                        borderTop: "1px solid var(--cs-border)",
                                 display: "flex",
                                 justifyContent: "space-between",
                                 alignItems: "center",
                                 gap: "12px"
                             }}
                         >
-                            <span style={{ color: "#667781" }}>
+                            <span style={{ color: "var(--cs-readable-muted, var(--cs-muted))" }}>
                                 {newGroupMembers.length} selected
                             </span>
 
@@ -5445,13 +5636,17 @@ if (
                                     newGroupMembers.length === 0
                                 }
                                 style={{
-                                    border: "none",
                                     background:
                                         !newGroupName.trim() ||
                                         newGroupMembers.length === 0
-                                            ? "#cbd5e1"
+                                            ? "var(--cs-surface-raised)"
                                             : "var(--cs-brand)",
-                                    color: "#ffffff",
+                                    color: !newGroupName.trim() || newGroupMembers.length === 0
+                                        ? "var(--cs-readable-muted, var(--cs-muted))"
+                                        : "#ffffff",
+                                    border: !newGroupName.trim() || newGroupMembers.length === 0
+                                        ? "1px solid var(--cs-border)"
+                                        : "1px solid var(--cs-brand)",
                                     padding: "11px 22px",
                                     borderRadius: "22px",
                                     cursor:
@@ -5476,31 +5671,47 @@ if (
                 onClose={() => setShowChatSummary(false)}
             />
         )}
+        {showWallpaperDialog && selectedUser && !isSelfChat && (
+            <ConversationWallpaperDialog
+                peer={selectedUser}
+                onClose={() => setShowWallpaperDialog(false)}
+                onUpdated={handleConversationWallpaperUpdated}
+            />
+        )}
         {reportDraft && (
             <div className="cs-report-backdrop" role="presentation" onMouseDown={(event) => {
-                if (event.target === event.currentTarget) setReportDraft(null);
+                if (event.target === event.currentTarget && !reportStatus[reportDraft._id]?.loading) setReportDraft(null);
             }}>
                 <section className="cs-report-dialog" role="dialog" aria-modal="true" aria-labelledby="cs-report-title">
-                    <button type="button" className="cs-report-close" aria-label="Close report dialog" onClick={() => setReportDraft(null)}><X size={18} /></button>
+                    <button type="button" className="cs-report-close" aria-label="Close report dialog" disabled={Boolean(reportStatus[reportDraft._id]?.loading)} onClick={() => setReportDraft(null)}><X size={18} /></button>
                     <h2 id="cs-report-title">Report message</h2>
-                    <p>Choose the closest reason. Your identity is not shared with the message sender.</p>
-                    <label htmlFor="cs-report-reason">Reason</label>
-                    <select id="cs-report-reason" value={reportReason} onChange={(event) => setReportReason(event.target.value)}>
-                        <option value="suspected_scam">Suspected scam</option>
-                        <option value="credential_request">Password or code request</option>
-                        <option value="suspicious_link">Suspicious link</option>
-                        <option value="spam">Spam</option>
-                        <option value="other">Other</option>
-                    </select>
-                    <label htmlFor="cs-report-details">Optional details</label>
-                    <textarea id="cs-report-details" maxLength={500} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} placeholder="Add context (up to 500 characters)" />
-                    <div className="cs-report-dialog-actions">
-                        <button type="button" onClick={() => setReportDraft(null)}>Keep message</button>
-                        <button type="button" disabled={Boolean(reportStatus[reportDraft._id]?.loading)} onClick={submitMessageReport}>
-                            {reportStatus[reportDraft._id]?.loading ? "Submitting…" : "Confirm report"}
-                        </button>
-                    </div>
-                    {reportStatus[reportDraft._id]?.message && <div className="cs-report-error" role="alert">{reportStatus[reportDraft._id].message}</div>}
+                    {reportStatus[reportDraft._id]?.success ? (
+                        <>
+                            <div className="cs-report-success" role="status">Report submitted. Thank you for helping keep ChatSpace safe.</div>
+                            <div className="cs-report-dialog-actions"><button type="button" onClick={() => setReportDraft(null)}>Close</button></div>
+                        </>
+                    ) : (
+                        <>
+                            <p>Choose a reason and review it before submitting. Your report is private and will not be shown to the sender.</p>
+                            <label htmlFor="cs-report-reason">Reason</label>
+                            <select id="cs-report-reason" value={reportReason} onChange={(event) => setReportReason(event.target.value)}>
+                                <option value="suspected_scam">Suspected scam or fraud</option>
+                                <option value="suspicious_link">Suspicious link</option>
+                                <option value="impersonation">Impersonation</option>
+                                <option value="sensitive_information">Request for sensitive information</option>
+                                <option value="other">Other</option>
+                            </select>
+                            <label htmlFor="cs-report-details">Optional details</label>
+                            <textarea id="cs-report-details" maxLength={500} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} placeholder="Add context (up to 500 characters)" />
+                            <div className="cs-report-dialog-actions">
+                                <button type="button" disabled={Boolean(reportStatus[reportDraft._id]?.loading)} onClick={() => setReportDraft(null)}>Cancel</button>
+                                <button type="button" disabled={Boolean(reportStatus[reportDraft._id]?.loading)} onClick={submitMessageReport}>
+                                    {reportStatus[reportDraft._id]?.loading ? "Submitting…" : "Confirm and submit report"}
+                                </button>
+                            </div>
+                            {reportStatus[reportDraft._id]?.message && <div className="cs-report-error" role="alert">{reportStatus[reportDraft._id].message}</div>}
+                        </>
+                    )}
                 </section>
             </div>
         )}

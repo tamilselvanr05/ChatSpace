@@ -54,6 +54,16 @@ const userSchema = new mongoose.Schema({
         default: false
     },
 
+    showOnlineStatus: {
+        type: Boolean,
+        default: true
+    },
+
+    typingIndicatorEnabled: {
+        type: Boolean,
+        default: true
+    },
+
     readReceiptsEnabled: {
         type: Boolean,
         default: true

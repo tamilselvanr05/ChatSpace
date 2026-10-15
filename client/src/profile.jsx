@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
-import { Settings } from "lucide-react";
+import Cropper from "react-easy-crop";
+import { RotateCcw, RotateCw, Settings, ZoomIn, ZoomOut } from "lucide-react";
 import { apiUrl } from "./config";
 import { ProtectedImage } from "./components/ProtectedMedia";
+import PhotoViewer from "./components/PhotoViewer";
+import { getCroppedImage } from "./utils/cropImage";
+
+const SUPPORTED_PROFILE_PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 function Profile() {
     const navigate = useNavigate();
@@ -13,8 +18,39 @@ function Profile() {
     const [editing, setEditing] = useState(false);
     const [newUsername, setNewUsername] = useState("");
     const [profilePhoto, setProfilePhoto] = useState(null);
+    const [photoEditorSource, setPhotoEditorSource] = useState(null);
+    const [crop, setCrop] = useState({ x: 0, y: 0 });
+    const [zoom, setZoom] = useState(1);
+    const [rotation, setRotation] = useState(0);
+    const [croppedAreaPixels, setCroppedAreaPixels] = useState(null);
+    const [photoPreview, setPhotoPreview] = useState(null);
+    const photoPreviewUrl = photoPreview?.url || null;
+    const [photoError, setPhotoError] = useState("");
+    const [photoSaving, setPhotoSaving] = useState(false);
+    const [showProfilePhoto, setShowProfilePhoto] = useState(false);
 
     const fileInputRef = useRef(null);
+
+    useEffect(() => () => {
+        if (photoEditorSource) URL.revokeObjectURL(photoEditorSource);
+    }, [photoEditorSource]);
+
+    useEffect(() => () => {
+        if (photoPreview?.url) URL.revokeObjectURL(photoPreview.url);
+    }, [photoPreview]);
+
+    useEffect(() => {
+        if (!photoEditorSource) return undefined;
+        const closeOnEscape = (event) => {
+            if (event.key === "Escape" && !photoSaving) {
+                setPhotoEditorSource(null);
+                setPhotoPreview(null);
+                setPhotoError("");
+            }
+        };
+        window.addEventListener("keydown", closeOnEscape);
+        return () => window.removeEventListener("keydown", closeOnEscape);
+    }, [photoEditorSource, photoSaving]);
 
     useEffect(() => {
         fetchProfile();
@@ -57,72 +93,66 @@ function Profile() {
 
     }
 
-    const handlePhotoChange = async (e) => {
-
-        const file =
-            e.target.files[0];
+    const handlePhotoChange = (e) => {
+        const file = e.target.files?.[0];
+        e.target.value = "";
 
         if (!file) {
             return;
         }
 
-        if (
-            !file.type.startsWith(
-                "image/"
-            )
-        ) {
-
-            alert(
-                "Please select an image"
-            );
-
+        if (!SUPPORTED_PROFILE_PHOTO_TYPES.has(file.type)) {
+            setPhotoError("Choose a JPEG, PNG, or WebP image.");
             return;
         }
-
-        if (
-            file.size >
-            10 * 1024 * 1024
-        ) {
-
-            alert(
-                "Image must be less than 10 MB"
-            );
-
+        if (file.size > 10 * 1024 * 1024) {
+            setPhotoError("Image must be smaller than 10 MB.");
             return;
         }
+        setPhotoError("");
+        setCrop({ x: 0, y: 0 });
+        setZoom(1);
+        setRotation(0);
+        setPhotoPreview(null);
+        setPhotoEditorSource(URL.createObjectURL(file));
+    };
 
+    const closePhotoEditor = () => {
+        if (photoSaving) return;
+        setPhotoEditorSource(null);
+        setPhotoPreview(null);
+        setPhotoError("");
+    };
+
+    const previewCroppedPhoto = async () => {
+        if (!photoEditorSource || !croppedAreaPixels) return;
         try {
-            const formData =
-                new FormData();
-
-            formData.append(
-                "file",
-                file
-            );
-
-            const response =
-                await axios.put(
-                    apiUrl("/profile/photo"),
-                    formData
-                );
-
-            setProfilePhoto(
-                response.data.profilePhoto
-            );
-
-        } catch (error) {
-
-            console.log(
-                error.response?.data ||
-                error.message
-            );
-
-            alert(
-                "Profile photo upload failed"
-            );
-
+            const blob = await getCroppedImage(photoEditorSource, croppedAreaPixels, rotation);
+            setPhotoPreview({ blob, url: URL.createObjectURL(blob) });
+            setPhotoError("");
+        } catch {
+            setPhotoError("This image could not be prepared. Choose another image and try again.");
         }
+    };
 
+    const saveCroppedPhoto = async () => {
+        if (!photoPreview || photoSaving) return;
+        setPhotoSaving(true);
+        setPhotoError("");
+        try {
+            const formData = new FormData();
+            formData.append("file", new File([photoPreview.blob], "profile-photo.jpg", { type: "image/jpeg" }));
+            const response = await axios.put(apiUrl("/profile/photo"), formData);
+            setProfilePhoto(response.data.profilePhoto);
+            setUser((previous) => previous ? { ...previous, profilePhoto: response.data.profilePhoto } : previous);
+            setShowProfilePhoto(false);
+            setPhotoEditorSource(null);
+            setPhotoPreview(null);
+        } catch (error) {
+            setPhotoError(error.response?.data?.message || "Profile photo upload failed. You can retry without selecting the image again.");
+        } finally {
+            setPhotoSaving(false);
+        }
     };
 
     const updateProfile = async () => {
@@ -177,7 +207,6 @@ function Profile() {
     }
 
     return (
-
             <main
                 className="cs-profile-page"
             style={{
@@ -261,41 +290,24 @@ function Profile() {
                     >
 
                         {profilePhoto ? (
-
-                            <ProtectedImage
-                                path={`/media/profiles/${user._id}`}
-                                refreshKey={profilePhoto}
-                                alt="Profile"
-                                style={{
-                                    width: "140px",
-                                    height: "140px",
-                                    borderRadius: "50%",
-                                    objectFit: "cover"
-                                }}
-                            />
-
+                            <button type="button" className="cs-profile-photo-view-trigger" aria-label="View profile photo" onClick={() => setShowProfilePhoto(true)}>
+                                <ProtectedImage
+                                    path={`/media/profiles/${user._id}`}
+                                    refreshKey={profilePhoto}
+                                    alt="Profile photo"
+                                    className="cs-profile-photo-fallback"
+                                    fallback="👤"
+                                    style={{ width: "140px", height: "140px", borderRadius: "50%", objectFit: "cover" }}
+                                />
+                            </button>
                         ) : (
-
-                            <div
-                                style={{
-                                    width: "140px",
-                                    height: "140px",
-                                    borderRadius: "50%",
-                                    background: "#d9d9d9",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    fontSize: "65px"
-                                }}
-                            >
-                                👤
-                            </div>
-
+                            <div className="cs-profile-photo-fallback" aria-label="No profile photo">👤</div>
                         )}
 
                     </div>
 
                     <button
+                        type="button"
                         onClick={() =>
                             fileInputRef.current.click()
                         }
@@ -316,7 +328,7 @@ function Profile() {
                         name="profilePhoto"
                         ref={fileInputRef}
                         type="file"
-                        accept="image/*"
+                        accept="image/jpeg,image/png,image/webp"
                         onChange={
                             handlePhotoChange
                         }
@@ -326,6 +338,8 @@ function Profile() {
                     />
 
                 </div>
+
+                {photoError && !photoEditorSource && <p className="cs-profile-photo-error" role="alert">{photoError}</p>}
 
                 <div
                     className="cs-profile-details"
@@ -452,8 +466,68 @@ function Profile() {
 
             </div>
 
-        </main>
+        {photoEditorSource && (
+            <div className="cs-photo-editor-backdrop" role="presentation" onMouseDown={(event) => {
+                if (event.target === event.currentTarget) closePhotoEditor();
+            }}>
+                <section className="cs-photo-editor" role="dialog" aria-modal="true" aria-labelledby="cs-photo-editor-title">
+                    <h2 id="cs-photo-editor-title">Edit profile photo</h2>
+                    <p>Drag to reposition, zoom, and rotate your square crop.</p>
+                    <div className="cs-photo-editor-crop-area">
+                        {photoPreviewUrl ? (
+                            <img className="cs-photo-editor-final-preview" src={photoPreviewUrl} alt="Preview of the cropped profile photo" />
+                        ) : (
+                            <Cropper
+                                image={photoEditorSource}
+                                crop={crop}
+                                zoom={zoom}
+                                rotation={rotation}
+                                aspect={1}
+                                cropShape="round"
+                                showGrid={false}
+                                onCropChange={setCrop}
+                                onZoomChange={setZoom}
+                                onRotationChange={setRotation}
+                                onCropComplete={(_, pixels) => setCroppedAreaPixels(pixels)}
+                            />
+                        )}
+                    </div>
+                    {!photoPreviewUrl && (
+                        <>
+                            <label className="cs-photo-editor-zoom">
+                                <ZoomOut size={17} aria-hidden="true" />
+                                <span>Zoom</span>
+                                <input aria-label="Zoom profile photo" type="range" min="1" max="3" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} />
+                                <ZoomIn size={17} aria-hidden="true" />
+                            </label>
+                            <div className="cs-photo-editor-rotate">
+                                <button type="button" onClick={() => setRotation((value) => (value - 90 + 360) % 360)}><RotateCcw size={17} /> Rotate left</button>
+                                <button type="button" onClick={() => setRotation((value) => (value + 90) % 360)}><RotateCw size={17} /> Rotate right</button>
+                            </div>
+                        </>
+                    )}
+                    <div className="cs-photo-editor-actions">
+                        <button type="button" onClick={closePhotoEditor} disabled={photoSaving}>Cancel</button>
+                        {photoPreviewUrl ? (
+                            <>
+                                <button type="button" onClick={() => setPhotoPreview(null)} disabled={photoSaving}>Adjust crop</button>
+                                <button type="button" onClick={saveCroppedPhoto} disabled={photoSaving}>{photoSaving ? "Saving…" : "Save photo"}</button>
+                            </>
+                        ) : (
+                            <button type="button" onClick={previewCroppedPhoto} disabled={!croppedAreaPixels || photoSaving}>Preview crop</button>
+                        )}
+                    </div>
+                    {photoError && <p className="cs-photo-editor-error" role="alert">{photoError}</p>}
+                </section>
+            </div>
+        )}
 
+        <PhotoViewer
+            images={showProfilePhoto && profilePhoto ? [{ _id: user._id, mediaPath: `/media/profiles/${user._id}`, refreshKey: profilePhoto, fileName: user.username }] : []}
+            activeIndex={0}
+            onClose={() => setShowProfilePhoto(false)}
+        />
+        </main>
     );
 
 }

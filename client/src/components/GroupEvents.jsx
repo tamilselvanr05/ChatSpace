@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import socket from "../socket";
 import { API_BASE_URL } from "../config";
+import { localDateValue, localTimeValue, validateLocalEventDateTime } from "../utils/groupEventDate";
 
 const API = API_BASE_URL;
 const blankForm = { title: "", description: "", date: "", time: "", location: "" };
@@ -23,9 +24,15 @@ export default function GroupEvents({ group, userId }) {
     const [error, setError] = useState("");
     const [notice, setNotice] = useState("");
     const [editingId, setEditingId] = useState(null);
+    const [editingOriginalTimestamp, setEditingOriginalTimestamp] = useState(null);
     const [form, setForm] = useState(blankForm);
     const [saving, setSaving] = useState(false);
-    const [now] = useState(() => Date.now());
+    const [now, setNow] = useState(() => Date.now());
+
+    useEffect(() => {
+        const clock = window.setInterval(() => setNow(Date.now()), 15000);
+        return () => window.clearInterval(clock);
+    }, []);
 
     const loadEvents = useCallback(async () => {
         setLoading(true);
@@ -54,17 +61,18 @@ export default function GroupEvents({ group, userId }) {
 
     const saveEvent = async (event) => {
         event.preventDefault();
-        if (!form.date || !form.time) return setError("Choose a date and time.");
+        const validation = validateLocalEventDateTime(form.date, form.time, now, editingOriginalTimestamp);
+        if (validation.error) return setError(validation.error);
+        const preservesOriginalMinute = editingOriginalTimestamp != null &&
+            Math.floor(validation.date.getTime() / 60000) === Math.floor(editingOriginalTimestamp / 60000);
         setSaving(true);
         setError("");
         try {
-            const localStart = new Date(`${form.date}T${form.time}`);
-            if (Number.isNaN(localStart.getTime())) throw new Error("Choose a valid date and time.");
             const payload = {
                 title: form.title,
                 description: form.description,
                 location: form.location,
-                startsAt: localStart.toISOString()
+                startsAt: new Date(preservesOriginalMinute ? editingOriginalTimestamp : validation.date.getTime()).toISOString()
             };
             if (editingId) {
                 await axios.put(`${API}/groups/${group._id}/events/${editingId}`, payload);
@@ -75,6 +83,7 @@ export default function GroupEvents({ group, userId }) {
             }
             setForm(blankForm);
             setEditingId(null);
+            setEditingOriginalTimestamp(null);
             await loadEvents();
         } catch (requestError) {
             setError(requestError.response?.data?.message || requestError.message || "Event could not be saved.");
@@ -108,8 +117,17 @@ export default function GroupEvents({ group, userId }) {
 
     const beginEdit = (event) => {
         setEditingId(event._id);
+        setEditingOriginalTimestamp(new Date(event.startsAt).getTime());
         setForm({ title: event.title, description: event.description || "", ...localDateTime(event.startsAt), location: event.location || "" });
     };
+
+    const today = localDateValue(new Date(now));
+    const originalLocalDate = editingOriginalTimestamp == null
+        ? null
+        : localDateTime(editingOriginalTimestamp).date;
+    const dateMinimum = editingOriginalTimestamp != null && editingOriginalTimestamp < now
+        ? originalLocalDate
+        : today;
 
     const ordered = [...events].sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
     const sections = [
@@ -124,10 +142,10 @@ export default function GroupEvents({ group, userId }) {
             <strong>{editingId ? "Edit event" : "Create event"}</strong>
             <input id="event-title" name="title" aria-label="Event title" placeholder="Event title" maxLength={120} required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
             <textarea id="event-description" name="description" aria-label="Event description" placeholder="Description" maxLength={2000} rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
-            <label>Date<input id="event-date" name="date" aria-label="Event date" type="date" required value={form.date} onChange={(e) => { setForm({ ...form, date: e.target.value }); e.currentTarget.blur(); }} /></label>
-            <label>Time<input id="event-time" name="time" aria-label="Event time" type="time" required value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></label>
+            <label>Date<input id="event-date" name="date" aria-label="Event date" type="date" required min={dateMinimum} value={form.date} onChange={(e) => { setForm({ ...form, date: e.target.value }); e.currentTarget.blur(); }} /></label>
+            <label>Time<input id="event-time" name="time" aria-label="Event time" type="time" required min={form.date === today && !(editingOriginalTimestamp != null && editingOriginalTimestamp < now && form.date === originalLocalDate) ? localTimeValue(new Date(now)) : undefined} value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></label>
             <input id="event-location" name="location" aria-label="Location" placeholder="Location (optional)" maxLength={200} value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} />
-            <div className="cs-event-actions"><button type="submit" disabled={saving}>{saving ? "Saving…" : editingId ? "Save changes" : "Create event"}</button>{editingId && <button type="button" onClick={() => { setEditingId(null); setForm(blankForm); }}>Discard</button>}</div>
+            <div className="cs-event-actions"><button type="submit" disabled={saving}>{saving ? "Saving…" : editingId ? "Save changes" : "Create event"}</button>{editingId && <button type="button" onClick={() => { setEditingId(null); setEditingOriginalTimestamp(null); setForm(blankForm); }}>Discard</button>}</div>
         </form>
         {error && <p role="alert" className="cs-event-error">{error}</p>}
         {notice && <p role="status" className="cs-event-notice">{notice}</p>}

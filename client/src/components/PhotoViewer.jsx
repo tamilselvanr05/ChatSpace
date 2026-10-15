@@ -1,7 +1,12 @@
 import { useEffect, useRef } from "react";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 import { getWrappedImageIndex } from "../utils/photoNavigation";
-import { ProtectedImage } from "./ProtectedMedia";
+import { ProtectedDownload, ProtectedImage } from "./ProtectedMedia";
+
+const downloadableImageTypes = new Set([
+    "image/avif", "image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"
+]);
+const downloadableImageExtensions = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"]);
 
 function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
     const closeButtonRef = useRef(null);
@@ -70,6 +75,10 @@ function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
     if (!image) return null;
 
     const multipleImages = images.length > 1;
+    const imageType = String(image.fileType || "").split(";")[0].trim().toLowerCase();
+    const imageExtension = String(image.fileName || "").split(".").pop().toLowerCase();
+    const canDownloadImage = image.messageType === "image" &&
+        (downloadableImageTypes.has(imageType) || downloadableImageExtensions.has(imageExtension));
     const navigate = (direction) => {
         const nextIndex = getWrappedImageIndex(activeIndex, direction, images.length);
         if (nextIndex >= 0) onNavigate(nextIndex);
@@ -118,9 +127,11 @@ function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
                 <div className="cs-photo-viewer-content" onClick={(event) => event.stopPropagation()}>
                     <ProtectedImage
                         key={image._id}
-                        path={`/media/messages/${image._id}`}
+                        path={image.mediaPath || `/media/messages/${image._id}`}
+                        refreshKey={image.refreshKey}
                         alt={image.fileName || "Shared photo"}
                         className="cs-photo-viewer-error"
+                        fallback={image.mediaPath?.startsWith("/media/profiles/") ? "👤" : "This photo could not be loaded."}
                         loadingLabel="Loading photo…"
                         fallback="This photo could not be loaded."
                     />
@@ -130,6 +141,16 @@ function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
                         </span>
                     )}
                     {image.fileName && <span className="cs-photo-viewer-caption">{image.fileName}</span>}
+                    {!image.mediaPath?.startsWith("/media/profiles/") && canDownloadImage && (
+                        <ProtectedDownload
+                            className="cs-photo-viewer-download"
+                            path={image.mediaPath || `/media/messages/${image._id}`}
+                            fileName={image.fileName || `shared-photo-${activeIndex + 1}.jpg`}
+                        >
+                            <Download size={16} />
+                            Download photo
+                        </ProtectedDownload>
+                    )}
                 </div>
             </section>
         </div>

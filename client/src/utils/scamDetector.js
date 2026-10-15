@@ -5,8 +5,13 @@ const SHORTENERS = new Set([
 const patterns = [
     {
         risk: "High",
-        reason: "This message asks for a password, OTP, or verification code.",
-        test: (text) => /\b(?:send|share|give|provide|reply\s+with|tell\s+me|enter|confirm)\b/i.test(text) && /\b(?:password|passcode|otp|one[ -]?time(?:\s+password)?|verification\s+code|security\s+code|login credentials?)\b/i.test(text)
+        reason: "This message combines a request for a password or verification code with pressure, secrecy, or an authority claim.",
+        test: (text) => {
+            const requestsSecret = /\b(?:send|share|give|provide|reply\s+with|tell\s+me|enter|confirm)\b/i.test(text) && /\b(?:password|passcode|otp|one[ -]?time(?:\s+password)?|verification\s+code|security\s+code|login credentials?|recovery code|card number|banking pin)\b/i.test(text);
+            const pressureOrSecrecy = /\b(?:urgent(?:ly)?|immediately|act\s+now|within\s+\d+\s*(?:minutes?|hours?)|account\s+(?:will\s+be\s+)?(?:suspended|locked|closed)|final\s+warning|do\s+not\s+tell|keep\s+this\s+(?:secret|private)|bypass\s+(?:security|verification))\b/i.test(text);
+            const authorityClaim = /\b(?:bank|security|support|police|government|it)\s+(?:team|department|officer|agent|representative)\b/i.test(text) || /\b(?:i am|this is)\s+(?:your\s+)?(?:bank|security|support|it\s+support)\b/i.test(text);
+            return requestsSecret && (pressureOrSecrecy || authorityClaim);
+        }
     },
     {
         risk: "High",
@@ -52,7 +57,7 @@ export function detectSuspiciousMessage(message) {
     const reasons = patterns.filter((rule) => rule.test(message)).map((rule) => rule.reason);
     reasons.push(...urlRisk(message));
     if (!reasons.length) return null;
-    const risk = reasons.some((reason) => reason.startsWith("This message asks") || reason.startsWith("Urgent pressure"))
+    const risk = reasons.some((reason) => reason.startsWith("This message combines") || reason.startsWith("Urgent pressure"))
         ? "High"
         : reasons.some((reason) => reason.includes("URL-shortening") || reason.includes("unusual or obscured"))
             ? "Medium"

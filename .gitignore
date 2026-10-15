@@ -6,6 +6,7 @@
 
 # Firebase service account
 server/firebase-service-account.json
+server/uploads/
 
 # Dependencies
 node_modules/

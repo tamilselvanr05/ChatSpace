@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { visibleReadBy } = require("./readReceiptUtils");
+const { canCreateReadReceipt, visibleReadBy } = require("./readReceiptUtils");
 
 function mockUserModel(enabledIds) {
     return {
@@ -29,4 +29,16 @@ test("messages without reads do not query users", async () => {
     const userModel = { find() { assert.fail("should not query users for empty receipts"); } };
     const [result] = await visibleReadBy({ readBy: [] }, userModel);
     assert.deepEqual(result.readBy, []);
+});
+
+test("read-receipt preference controls whether a read is recorded", async () => {
+    const makeUserModel = (enabled) => ({
+        findById(id) {
+            assert.equal(id, "reader");
+            return { select() { return { lean: async () => ({ readReceiptsEnabled: enabled }) }; } };
+        }
+    });
+    assert.equal(await canCreateReadReceipt("reader", makeUserModel(true)), true);
+    assert.equal(await canCreateReadReceipt("reader", makeUserModel(false)), false);
+    assert.equal(await canCreateReadReceipt("reader", makeUserModel(undefined)), true);
 });

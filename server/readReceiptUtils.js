@@ -15,4 +15,9 @@ async function visibleReadBy(messages, User) {
     }));
 }
 
-module.exports = { visibleReadBy };
+async function canCreateReadReceipt(readerId, User) {
+    const reader = await User.findById(readerId).select("readReceiptsEnabled").lean();
+    return Boolean(reader && reader.readReceiptsEnabled !== false);
+}
+
+module.exports = { canCreateReadReceipt, visibleReadBy };

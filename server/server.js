@@ -11,8 +11,9 @@ const GroupEvent = require("./models/groupEvent");
 const GroupEventRsvp = require("./models/groupEventRsvp");
 const CallHistory = require("./models/callHistory");
 const UploadedFile = require("./models/uploadedFile");
-const { buildCallHistoryQuery, canViewCallHistory, finalizeCallRecord } = require("./callHistoryUtils");
-const { visibleReadBy } = require("./readReceiptUtils");
+const ConversationWallpaper = require("./models/conversationWallpaper");
+const { buildCallHistoryQuery, canViewCallHistory, finalizeCallRecord, finalizeUnansweredCall } = require("./callHistoryUtils");
+const { canCreateReadReceipt, visibleReadBy } = require("./readReceiptUtils");
 const { buildPrivateConversationQuery, isSelfConversation, persistSelfMessage } = require("./selfConversation");
 const {
     claimUploadedAttachment,
@@ -25,24 +26,13 @@ const authMiddleware = require("./middleware/authMiddleware");
 const { resolveFirebaseUser } = require("./firebaseIdentity");
 const firebaseAdminAuth = require("./firebaseAdmin");
 const { buildProviderPrompt, createAuthorizedMessageLoader, createChatSummaryRouter, GEMINI_REQUEST_TIMEOUT_MS } = require("./chatSummarization");
-
-const messageReportAttempts = new Map();
-
-function consumeMessageReportLimit(userId) {
-    const now = Date.now();
-    const windowStart = now - 10 * 60 * 1000;
-    const recentAttempts = (messageReportAttempts.get(userId) || []).filter((time) => time > windowStart);
-    if (recentAttempts.length >= 5) {
-        messageReportAttempts.set(userId, recentAttempts);
-        return false;
-    }
-    recentAttempts.push(now);
-    messageReportAttempts.set(userId, recentAttempts);
-    for (const [id, attempts] of messageReportAttempts) {
-        if (!attempts.some((time) => time > windowStart)) messageReportAttempts.delete(id);
-    }
-    return true;
-}
+const { createMessageReportRouter } = require("./messageReports");
+const { createProfilePhotoRouter } = require("./profilePhotos");
+const { createConversationWallpaperRouter } = require("./conversationWallpapers");
+const { createPrivacyPreferencesRouter, sanitizeGroupPresence, sanitizePresence, typingMayBeBroadcast } = require("./privacyPreferences");
+const { createUserDirectoryRouter } = require("./userDirectory");
+const { parseEventDate } = require("./groupEventDate");
+const { getCallAvailability } = require("./callAvailability");
 
 async function getGroupEventDetails(eventId) {
     const event = await GroupEvent.findById(eventId).lean();
@@ -84,13 +74,6 @@ async function saveMessageWithUploadedFile(message, ownerId) {
     }
 }
 
-function parseEventDate(value) {
-    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date;
-}
-
-
 // Socket.IO imports
 const http = require("http");
 const { Server } = require("socket.io");
@@ -129,6 +112,11 @@ function corsOrigin(origin, callback) {
 
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
+
+app.get("/healthz", (req, res) => {
+    const ready = mongoose.connection.readyState === 1;
+    return res.status(ready ? 200 : 503).json({ status: ready ? "ok" : "unavailable" });
+});
 
 let geminiClient;
 app.use("/ai", createChatSummaryRouter({
@@ -197,9 +185,8 @@ app.patch("/preferences/read-receipts", authMiddleware, async (req, res) => {
 });
 
 
-const uploadFolder = path.join(
-    __dirname,
-    "uploads"
+const uploadFolder = path.resolve(
+    process.env.UPLOAD_DIR || path.join(__dirname, "uploads")
 );
 
 if (!fs.existsSync(uploadFolder)) {
@@ -268,40 +255,13 @@ const io = new Server(server, {
     }
 });
 
-app.post("/messages/:messageId/report", authMiddleware, async (req, res) => {
-    const { messageId } = req.params;
-    const reason = req.body?.reason;
-    const details = req.body?.details == null ? "" : req.body.details;
-    const allowedReasons = ["suspected_scam", "credential_request", "suspicious_link", "spam", "other"];
-    if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ message: "Invalid message ID" });
-    if (!allowedReasons.includes(reason) || typeof details !== "string" || details.trim().length > 500) {
-        return res.status(400).json({ message: "Choose a valid report reason and keep details within 500 characters" });
-    }
-    try {
-        const reporterId = req.user.userId;
-        const message = await Message.findOne({ _id: messageId, deletedFor: { $ne: reporterId } }).select("senderId receiverId groupId").lean();
-        if (!message) return res.status(404).json({ message: "Message not found" });
-        let canAccess = false;
-        if (message.groupId) {
-            canAccess = Boolean(await Group.exists({ _id: message.groupId, members: reporterId }));
-        } else {
-            canAccess = message.senderId.toString() === reporterId || message.receiverId?.toString() === reporterId;
-        }
-        if (!canAccess) return res.status(404).json({ message: "Message not found" });
-        if (await MessageReport.exists({ reporterId, messageId })) {
-            return res.status(409).json({ message: "You have already reported this message" });
-        }
-        if (!consumeMessageReportLimit(reporterId)) {
-            return res.status(429).json({ message: "Report limit reached. Try again later." });
-        }
-        await MessageReport.create({ reporterId, messageId, reason, details: details.trim() });
-        return res.status(201).json({ message: "Report submitted" });
-    } catch (error) {
-        if (error.code === 11000) return res.status(409).json({ message: "You have already reported this message" });
-        console.error("Submit message report error:", error.code || "unknown");
-        return res.status(500).json({ message: "Report could not be submitted" });
-    }
-});
+app.use("/messages", createMessageReportRouter({
+    authMiddleware,
+    isValidId: mongoose.Types.ObjectId.isValid,
+    Message,
+    Group,
+    MessageReport
+}));
 
 io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
@@ -366,19 +326,19 @@ function startCallTimeout(call) {
     const callId = call.callId;
     const callerId = call.callerId.toString();
     const calleeId = call.calleeId.toString();
-    const timeout = setTimeout(async () => {
+    const existingTimeout = callTimeoutsById.get(callId);
+    if (existingTimeout) clearTimeout(existingTimeout);
+    let timeout;
+    timeout = setTimeout(async () => {
+        if (callTimeoutsById.get(callId) !== timeout) return;
         callTimeoutsById.delete(callId);
         try {
-            const endedAt = new Date();
-            const missedCall = await CallHistory.findOneAndUpdate(
-                { callId, status: "pending", connectedAt: null },
-                { $set: { status: "missed", endedAt, durationSeconds: 0 } },
-                { new: true }
-            );
+            if (process.env.NODE_ENV !== "production") console.warn("[call diagnostic] unanswered call timeout", { callId, reason: "60 seconds without connection", callerId, calleeId });
+            const missedCall = await finalizeUnansweredCall(CallHistory, callId);
             if (!missedCall) return;
             emitCallHistory(missedCall);
             clearCallSession(callId, callerId, calleeId);
-            io.to(callerId).emit("call:end", { from: calleeId, to: callerId, callId });
+            io.to(callerId).emit("call:timeout", { from: calleeId, to: callerId, callId, timeoutMs: callRingTimeoutMs });
             io.to(calleeId).emit("call:end", { from: callerId, to: calleeId, callId });
         } catch (error) {
             console.error("Call timeout finalization failed", error.code || "unknown");
@@ -522,12 +482,12 @@ app.get("/groups", authMiddleware, async (req, res) => {
             members: userId
         }).populate(
             "members",
-            "username profilePhoto isOnline"
+            "username profilePhoto isOnline showOnlineStatus"
         );
 
         res.status(200).json({
             message: "Groups fetched successfully",
-            groups: groups
+            groups: groups.map((group) => sanitizeGroupPresence(group, userId))
         });
 
     } catch (error) {
@@ -594,13 +554,23 @@ app.put("/groups/:groupId/events/:eventId", authMiddleware, async (req, res) => 
     const title = typeof body?.title === "string" ? body.title.trim() : "";
     const description = body?.description == null ? "" : typeof body.description === "string" ? body.description.trim() : null;
     const location = body?.location == null ? "" : typeof body.location === "string" ? body.location.trim() : null;
-    const startsAt = parseEventDate(body?.startsAt);
-    if (!title || title.length > 120 || description === null || description.length > 2000 || location === null || location.length > 200 || !startsAt) {
+    if (!title || title.length > 120 || description === null || description.length > 2000 || location === null || location.length > 200) {
         return res.status(400).json({ message: "Enter a title, valid date and time, and values within the field limits" });
     }
     try {
         const group = await Group.findOne({ _id: groupId, members: req.user.userId }).select("_id");
         if (!group) return res.status(404).json({ message: "Group not found" });
+        const existingEvent = await GroupEvent.findOne({
+            _id: eventId,
+            groupId,
+            createdBy: req.user.userId,
+            cancelled: false
+        }).select("startsAt");
+        if (!existingEvent) return res.status(403).json({ message: "Only the event creator can edit this event" });
+        const startsAt = parseEventDate(body?.startsAt, {
+            allowPastTimestamp: new Date(existingEvent.startsAt).getTime()
+        });
+        if (!startsAt) return res.status(400).json({ message: "Choose a valid date and time that is not in the past" });
         const event = await GroupEvent.findOneAndUpdate(
             { _id: eventId, groupId, createdBy: req.user.userId, cancelled: false },
             { $set: { title, description, location, startsAt } },
@@ -746,15 +716,16 @@ app.put("/groups/:groupId/members", authMiddleware, async (req, res) => {
         await group.save();
 
         const updatedGroup = await Group.findById(groupId)
-            .populate("members", "username profilePhoto isOnline");
+            .populate("members", "username profilePhoto isOnline showOnlineStatus");
 
         for (const member of updatedGroup.members) {
-            io.to(member._id.toString()).emit("groupMembersUpdated", updatedGroup);
+            const memberId = member._id.toString();
+            io.to(memberId).emit("groupMembersUpdated", sanitizeGroupPresence(updatedGroup, memberId));
         }
 
         res.status(200).json({
             message: "Members added successfully",
-            group: updatedGroup
+            group: sanitizeGroupPresence(updatedGroup, req.user.userId)
         });
 
     } catch (error) {
@@ -875,6 +846,46 @@ app.get(
     createProfileMediaHandler({ User, uploadFolder })
 );
 
+app.use("/profile/photo", createProfilePhotoRouter({
+    authMiddleware,
+    upload: upload.single("file"),
+    User,
+    Message,
+    UploadedFile,
+    ConversationWallpaper,
+    io,
+    uploadFolder
+}));
+
+app.use("/conversations", createConversationWallpaperRouter({
+    authMiddleware,
+    upload: upload.single("file"),
+    isValidId: mongoose.Types.ObjectId.isValid,
+    User,
+    ConversationWallpaper,
+    Message,
+    UploadedFile,
+    uploadFolder
+}));
+
+app.use("/preferences/privacy", createPrivacyPreferencesRouter({
+    authMiddleware,
+    User,
+    Group,
+    io,
+    areUsersBlocked,
+    logger: console
+}));
+
+app.use("/users", createUserDirectoryRouter({
+    authMiddleware,
+    User,
+    io,
+    isValidId: mongoose.Types.ObjectId.isValid,
+    sanitizePresence,
+    logger: console
+}));
+
 // ==================== SOCKET.IO ====================
 
 // ==================== SOCKET.IO ====================
@@ -891,12 +902,13 @@ io.on("connection", (socket) => {
 
     User.findByIdAndUpdate(
         authenticatedUserId,
-        { isOnline: true }
-    ).then(async () => {
+        { isOnline: true },
+        { new: true, projection: { showOnlineStatus: 1 } }
+    ).then(async (user) => {
         if (socket.connected) {
             io.emit("userStatusChanged", {
                 userId: authenticatedUserId,
-                isOnline: true
+                isOnline: user?.showOnlineStatus !== false
             });
             return;
         }
@@ -914,6 +926,11 @@ io.on("connection", (socket) => {
 
     socket.on("typing", async (data = {}) => {
         try {
+            const sender = await User.findById(authenticatedUserId)
+                .select("username typingIndicatorEnabled")
+                .lean();
+            if (!sender || !typingMayBeBroadcast(sender.typingIndicatorEnabled)) return;
+
             if (data.groupId) {
                 if (!mongoose.Types.ObjectId.isValid(data.groupId)) return;
                 const group = await Group.findOne({
@@ -921,7 +938,6 @@ io.on("connection", (socket) => {
                     members: authenticatedUserId
                 }).populate("members", "_id");
                 if (!group || !(await User.exists({ _id: authenticatedUserId, isDeleted: { $ne: true } }))) return;
-                const sender = await User.findById(authenticatedUserId).select("username").lean();
                 const groupTypingKey = `group:${group._id}`;
                 if (data.isTyping) {
                     socket.data.activeTypingConversations.set(groupTypingKey, { groupId: group._id.toString(), username: sender?.username || "A member" });
@@ -1403,6 +1419,8 @@ io.on("connection", (socket) => {
                 return;
             }
 
+            if (!await canCreateReadReceipt(userId, User)) return;
+
             const messageFilter = message.groupId
                 ? { _id: messageId, groupId: message.groupId }
                 : { _id: messageId, receiverId: userId };
@@ -1441,6 +1459,7 @@ io.on("connection", (socket) => {
         if (!mongoose.Types.ObjectId.isValid(to) || from === to) return;
 
         if (eventName === "call:offer") {
+            if (process.env.NODE_ENV !== "production") console.info("[call diagnostic] relaying call:offer", { to, from });
             if (!data.offer || !["audio", "video"].includes(data.callType) ||
                 !(await User.exists({ _id: to, isDeleted: { $ne: true }, isDeleting: { $ne: true } })) ||
                 await areUsersBlocked(from, to)) {
@@ -1455,15 +1474,25 @@ io.on("connection", (socket) => {
                 callType: data.callType,
                 initiatedAt: new Date()
             });
+            // `to` is a validated account ID, and its room membership is assigned only
+            // from authenticated socket.userId during connection setup.
             const recipientSockets = await io.in(to).fetchSockets();
-            if (recipientSockets.length === 0 || activeCallsByUser.has(from) || activeCallsByUser.has(to)) {
-                io.to(from).emit("call:created", { callId: call.callId, peerId: to });
+            const availability = getCallAvailability(
+                recipientSockets.length,
+                activeCallsByUser.has(from),
+                activeCallsByUser.has(to)
+            );
+            if (availability === "offline") {
                 await finalizeAndBroadcastCall(call.callId, "missed", to);
-                if (recipientSockets.length === 0) {
-                    io.to(from).emit("call:end", { from: to, to: from, callId: call.callId });
-                } else {
-                    io.to(from).emit("call:busy", { from: to, to: from, callId: call.callId });
-                }
+                if (process.env.NODE_ENV !== "production") console.info("[call diagnostic] recipient offline", { callId: call.callId, callerId: from, calleeId: to });
+                io.to(from).emit("call:offline", { from: to, to: from, callId: call.callId, attemptId: data.attemptId });
+                return;
+            }
+
+            if (availability === "busy") {
+                io.to(from).emit("call:created", { callId: call.callId, peerId: to, attemptId: data.attemptId });
+                await finalizeAndBroadcastCall(call.callId, "missed", to);
+                io.to(from).emit("call:busy", { from: to, to: from, callId: call.callId, attemptId: data.attemptId });
                 return;
             }
 
@@ -1471,7 +1500,7 @@ io.on("connection", (socket) => {
             activeCallsByUser.set(to, from);
             activeCallIdsByUser.set(from, call.callId);
             activeCallIdsByUser.set(to, call.callId);
-            io.to(from).emit("call:created", { callId: call.callId, peerId: to });
+            io.to(from).emit("call:created", { callId: call.callId, peerId: to, attemptId: data.attemptId });
             emitCallHistory(call);
             startCallTimeout(call);
             io.to(to).emit(eventName, { ...data, from, to, callId: call.callId });
@@ -1480,6 +1509,9 @@ io.on("connection", (socket) => {
 
         const callId = data.callId?.toString();
         if (!callId || activeCallIdsByUser.get(from) !== callId || activeCallsByUser.get(from) !== to) return;
+        if (process.env.NODE_ENV !== "production" && ["call:answer", "call:connected", "call:reject", "call:busy", "call:end"].includes(eventName)) {
+            console.info("[call diagnostic] relaying call event", { callId, eventName, from, to });
+        }
 
         if (eventName === "call:connected") {
             const call = await CallHistory.findOneAndUpdate(
@@ -1513,6 +1545,7 @@ io.on("connection", (socket) => {
                     ? "missed"
                     : "end";
             await finalizeAndBroadcastCall(callId, reason, from);
+            if (process.env.NODE_ENV !== "production") console.warn("[call diagnostic] call terminated", { callId, eventName, reason, actorId: from });
             clearCallSession(callId, from, to);
         }
     };
@@ -1577,6 +1610,7 @@ io.on("connection", (socket) => {
                 const callId = activeCallIdsByUser.get(authenticatedUserId);
 
                 if (peerId && callId) {
+                    if (process.env.NODE_ENV !== "production") console.warn("[call diagnostic] call terminated", { callId, reason: "last participant socket disconnected", actorId: authenticatedUserId, peerId });
                     await finalizeAndBroadcastCall(callId, "disconnect", authenticatedUserId);
                     clearCallSession(callId, authenticatedUserId, peerId);
                     io.to(peerId).emit("call:end", {
@@ -1920,120 +1954,6 @@ app.put("/profile", authMiddleware, async (req, res) => {
 
 });
 
-app.put(
-    "/profile/photo",
-    authMiddleware,
-    upload.single("file"),
-    async (req, res) => {
-
-        try {
-
-            if (!req.file) {
-                return res.status(400).json({
-                    message: "No photo uploaded"
-                });
-            }
-
-            if (!req.file.mimetype.startsWith("image/")) {
-                return res.status(400).json({
-                    message: "Only image files are allowed"
-                });
-            }
-
-            const user = await User.findById(req.user.userId);
-
-            if (!user) {
-                return res.status(404).json({
-                    message: "User not found"
-                });
-            }
-
-            const photoUrl = `/uploads/${req.file.filename}`;
-
-            user.profilePhoto = photoUrl;
-
-            await user.save();
-
-            res.status(200).json({
-                message: "Profile photo updated",
-                profilePhoto: photoUrl
-            });
-
-        } catch (error) {
-
-            console.log("Profile photo error:", error);
-
-            res.status(500).json({
-                message: "Failed to update profile photo"
-            });
-
-        }
-
-    }
-);
-
-app.delete(
-    "/profile/photo",
-    authMiddleware,
-    async (req, res) => {
-        try {
-            const user = await User.findById(req.user.userId);
-
-            if (!user) {
-                return res.status(404).json({
-                    message: "User not found"
-                });
-            }
-
-            if (!user.profilePhoto) {
-                return res.status(400).json({
-                    message: "No profile photo to remove"
-                });
-            }
-
-            const fs = require("fs");
-            const path = require("path");
-            const filePath = path.join(__dirname, user.profilePhoto);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-            }
-
-            user.profilePhoto = null;
-            await user.save();
-
-            res.status(200).json({
-                message: "Profile photo removed successfully"
-            });
-
-        } catch (error) {
-            console.log("Remove profile photo error:", error);
-            res.status(500).json({
-                message: "Failed to remove profile photo"
-            });
-        }
-    }
-);
-
-app.get("/users", authMiddleware, async (req, res) => {
-    try {
-        const currentUser = await User.findById(req.user.userId).select("hiddenConversations");
-        const users = await User.find({
-            _id: { $ne: req.user.userId, $nin: currentUser?.hiddenConversations || [] }
-        }).select("username about profilePhoto isOnline isDeleted");
-
-        res.status(200).json({
-            message: "Users fetched successfully",
-            users: users
-        });
-
-    } catch (error) {
-        res.status(500).json({
-            message: "Error getting users",
-            error: error.message
-        });
-    }
-});
-
 app.get("/blocked-users", authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user.userId)
@@ -2230,14 +2150,42 @@ app.put("/reset-password", authMiddleware, async (req, res) => {
 
 // ==================== MONGODB + SERVER ====================
 
-mongoose.connect(process.env.MONGO_URI)
-    .then(() => {
-        console.log("MongoDB Connected");
+async function startServer() {
+    if (!process.env.MONGO_URI) {
+        console.error("Server startup failed: MONGO_URI is required.");
+        process.exitCode = 1;
+        return;
+    }
 
-        server.listen(process.env.PORT, () => {
-            console.log(`Server running on port ${process.env.PORT}`);
+    const configuredPort = Number(process.env.PORT);
+    const port = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535
+        ? configuredPort
+        : 3030;
+
+    try {
+        await mongoose.connect(process.env.MONGO_URI);
+        await new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(port, "0.0.0.0", resolve);
         });
-    })
-    .catch((error) => {
-        console.log("MongoDB Connection Failed:", error);
+        console.info(`ChatSpace server listening on port ${port}`);
+    } catch (error) {
+        console.error("Server startup failed", error.code || error.name || "unknown");
+        await mongoose.disconnect().catch(() => {});
+        process.exitCode = 1;
+    }
+}
+
+function shutdownServer(signal) {
+    console.info(`Received ${signal}; shutting down ChatSpace.`);
+    const shutdownTimeout = setTimeout(() => process.exit(1), 10_000);
+    shutdownTimeout.unref();
+    io.close(async () => {
+        clearTimeout(shutdownTimeout);
+        await mongoose.disconnect();
     });
+}
+
+process.once("SIGINT", () => shutdownServer("SIGINT"));
+process.once("SIGTERM", () => shutdownServer("SIGTERM"));
+startServer();

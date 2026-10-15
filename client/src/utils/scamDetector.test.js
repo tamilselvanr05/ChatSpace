@@ -8,10 +8,20 @@ describe("detectSuspiciousMessage", () => {
         assert.equal(detectSuspiciousMessage("Thanks for sharing the project update."), null);
     });
 
-    it("warns on requests for passwords and verification codes", () => {
-        const result = detectSuspiciousMessage("Please send me your OTP and password now");
-        assert.equal(result.risk, "High");
-        assert.match(result.reasons.join(" "), /password, OTP, or verification code/);
+    it("does not warn on ordinary security-related wording by itself", () => {
+        assert.equal(detectSuspiciousMessage("Please send the OTP"), null);
+        assert.equal(detectSuspiciousMessage("I forgot my password; can you help me reset it?"), null);
+        assert.equal(detectSuspiciousMessage("I paid my rent through the bank app and got an OTP"), null);
+        assert.equal(detectSuspiciousMessage("The bank link is in the project notes"), null);
+    });
+
+    it("warns tentatively when a sensitive request is combined with coercion or an authority claim", () => {
+        const threat = detectSuspiciousMessage("Your bank account will be suspended immediately. Send your OTP now.");
+        assert.equal(threat.risk, "High");
+        assert.match(threat.reasons.join(" "), /combines a request.*pressure/);
+
+        const impersonation = detectSuspiciousMessage("Bank security team: reply with your password to verify your account.");
+        assert.equal(impersonation.risk, "High");
     });
 
     it("warns on urgent money pressure and prize fee patterns", () => {
