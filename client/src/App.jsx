@@ -5,6 +5,7 @@ import axios from "axios";
 import { onAuthStateChanged, signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiUrl } from "./config";
+import { getProfileUser } from "./utils/profileResponse";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
 import CallHistoryEntry from "./components/CallHistoryEntry";
@@ -662,8 +663,8 @@ useEffect(() => {
                     auth.currentUser?.uid !== firebaseUser.uid
                 ) return;
 
-                const authenticatedUser = response.data.user;
-                if (!authenticatedUser?._id) throw new Error("Authenticated profile has no user ID");
+                const authenticatedUser = getProfileUser(response);
+                if (!authenticatedUser) throw new Error("Authenticated profile has no user ID");
                 setUserId(authenticatedUser._id);
                 setProfileUser(authenticatedUser);
                 socket.connect();

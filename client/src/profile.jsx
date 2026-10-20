@@ -7,6 +7,7 @@ import { apiUrl } from "./config";
 import { ProtectedImage } from "./components/ProtectedMedia";
 import PhotoViewer from "./components/PhotoViewer";
 import { getCroppedImage } from "./utils/cropImage";
+import { getProfileUser } from "./utils/profileResponse";
 
 const SUPPORTED_PROFILE_PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -64,8 +65,8 @@ function Profile() {
                     apiUrl("/profile")
                 );
 
-            const profile =
-                response.data.user;
+            const profile = getProfileUser(response);
+            if (!profile) throw new Error("Profile response has no user ID");
 
             setUser(profile);
 
