@@ -1,3 +1,5 @@
+import { createElement } from "react";
+
 const inFlightRequests = new Map();
 const missingProfilePhotos = new Set();
 
@@ -8,6 +10,15 @@ function isProfilePhoto(path, mediaKind) {
 export function getProtectedImageFallback(path, fallback) {
     if (path?.startsWith("/media/profiles/")) return "\u{1F464}";
     return fallback ?? "Image unavailable";
+}
+
+export function createProtectedImageFallback({ path, fallback, alt, className, style }) {
+    return createElement("span", {
+        className,
+        role: "img",
+        "aria-label": alt || "Image unavailable",
+        style
+    }, getProtectedImageFallback(path, fallback));
 }
 
 export function requestProtectedMedia({ key, path, mediaKind, load }) {
