@@ -131,9 +131,8 @@ function PhotoViewer({ images, activeIndex, onClose, onNavigate }) {
                         refreshKey={image.refreshKey}
                         alt={image.fileName || "Shared photo"}
                         className="cs-photo-viewer-error"
-                        fallback={image.mediaPath?.startsWith("/media/profiles/") ? "👤" : "This photo could not be loaded."}
                         loadingLabel="Loading photo…"
-                        fallback="This photo could not be loaded."
+                        fallback={image.mediaPath?.startsWith("/media/profiles/") ? "👤" : "This photo could not be loaded."}
                     />
                     {multipleImages && (
                         <span className="cs-photo-viewer-count" aria-live="polite">

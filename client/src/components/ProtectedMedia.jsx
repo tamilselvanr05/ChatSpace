@@ -2,6 +2,7 @@ import { useState } from "react";
 import axios from "axios";
 import { apiUrl } from "../config";
 import { useProtectedMedia } from "../hooks/useProtectedMedia";
+import { getProtectedImageFallback } from "../utils/protectedMediaRequest";
 
 function safeDownloadName(value) {
     return [...String(value || "download")]
@@ -10,12 +11,12 @@ function safeDownloadName(value) {
         .join("");
 }
 
-export function ProtectedImage({ path, refreshKey, alt = "", className, style, onClick, fallback = "Image unavailable", loadingLabel = "Loading media…" }) {
+export function ProtectedImage({ path, refreshKey, alt = "", className, style, onClick, fallback, loadingLabel = "Loading media…" }) {
     const { url, error, loading } = useProtectedMedia(path, refreshKey, "image");
     const [failedUrl, setFailedUrl] = useState(null);
 
     if (error || (url && failedUrl === url)) {
-        return <span className={className} role="img" aria-label={alt || "Image unavailable"} style={style}>{fallback}</span>;
+        return <span className={className} role="img" aria-label={alt || "Image unavailable"} style={style}>{getProtectedImageFallback(path, fallback)}</span>;
     }
     if (!url) {
         return <span className={className} role="status" aria-label={loading ? loadingLabel : "Image unavailable"} style={style}>{loading ? loadingLabel : ""}</span>;
