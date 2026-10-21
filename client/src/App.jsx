@@ -5,6 +5,7 @@ import axios from "axios";
 import { onAuthStateChanged, signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiUrl } from "./config";
+import { getCallHistoryPeerId } from "./utils/callHistoryConversation";
 import { getProfileUser } from "./utils/profileResponse";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
@@ -907,14 +908,15 @@ useEffect(() => {
     }, [userId, closeCall, addPendingIceCandidates]);
 
     useEffect(() => {
-        const selectedPeerId = selectedUser?._id?.toString();
-        if (!userId || !selectedPeerId) {
-            setCallHistory([]);
-            return undefined;
-        }
+        setCallHistory([]);
+        const selectedPeerId = getCallHistoryPeerId({
+            selectedUserId: selectedUser?._id?.toString(),
+            selectedGroupId: selectedGroup?._id?.toString(),
+            currentUserId: userId?.toString()
+        });
+        if (!selectedPeerId) return undefined;
 
         let active = true;
-        setCallHistory([]);
 
         const mergeCall = (call) => {
             if (!active || !call) return;
@@ -951,7 +953,7 @@ useEffect(() => {
             active = false;
             socket.off("callHistory:updated", handleCallHistoryUpdated);
         };
-    }, [selectedUser?._id, userId]);
+    }, [selectedUser?._id, selectedGroup?._id, userId]);
 
     useEffect(() => {
         if (!userId) return undefined;
