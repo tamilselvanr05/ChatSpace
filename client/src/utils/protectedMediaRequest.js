@@ -6,7 +6,8 @@ function isProfilePhoto(path, mediaKind) {
 }
 
 export function getProtectedImageFallback(path, fallback) {
-    return fallback ?? (path?.startsWith("/media/profiles/") ? "\u{1F464}" : "Image unavailable");
+    if (path?.startsWith("/media/profiles/")) return "\u{1F464}";
+    return fallback ?? "Image unavailable";
 }
 
 export function requestProtectedMedia({ key, path, mediaKind, load }) {

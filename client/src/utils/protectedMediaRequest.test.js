@@ -42,6 +42,7 @@ test("confirmed profile photo 404s are cached, while a changed version can load"
 
 test("profile photo failures use the avatar fallback and other images keep their generic fallback", () => {
     assert.equal(getProtectedImageFallback("/media/profiles/user-1"), "\u{1F464}");
+    assert.equal(getProtectedImageFallback("/media/profiles/user-1", "This photo could not be loaded."), "\u{1F464}");
     assert.equal(getProtectedImageFallback("/media/messages/message-1"), "Image unavailable");
-    assert.equal(getProtectedImageFallback("/media/profiles/user-1", "Custom fallback"), "Custom fallback");
+    assert.equal(getProtectedImageFallback("/media/messages/message-1", "Custom fallback"), "Custom fallback");
 });
