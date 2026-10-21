@@ -10,6 +10,7 @@ const safeImageTypes = new Set([
     "image/png",
     "image/webp"
 ]);
+const failedMediaRequests = new Set();
 
 export function useProtectedMedia(path, refreshKey = "", mediaKind = "") {
     const requestKey = `${path || ""}\u0000${refreshKey || ""}\u0000${mediaKind}`;
@@ -20,6 +21,14 @@ export function useProtectedMedia(path, refreshKey = "", mediaKind = "") {
         const controller = new AbortController();
         let active = true;
         let objectUrl = null;
+
+        const cacheProfilePhotoFailure = mediaKind === "image" && path.startsWith("/media/profiles/");
+        if (cacheProfilePhotoFailure && failedMediaRequests.has(requestKey)) {
+            return () => {
+                active = false;
+                controller.abort();
+            };
+        }
 
         axios.get(apiUrl(path), {
             responseType: "blob",
@@ -37,8 +46,13 @@ export function useProtectedMedia(path, refreshKey = "", mediaKind = "") {
                 return;
             }
             setResult({ requestKey, url: objectUrl, error: null });
-        }).catch(() => {
-            if (active) setResult({ requestKey, url: null, error: "Media could not be loaded." });
+        }).catch((error) => {
+            if (active) {
+                if (cacheProfilePhotoFailure && error.response?.status === 404) {
+                    failedMediaRequests.add(requestKey);
+                }
+                setResult({ requestKey, url: null, error: "Media could not be loaded." });
+            }
         });
 
         return () => {
@@ -51,7 +65,9 @@ export function useProtectedMedia(path, refreshKey = "", mediaKind = "") {
     const currentResult = result?.requestKey === requestKey ? result : null;
     return {
         url: currentResult?.url || null,
-        error: currentResult?.error || null,
+        error: currentResult?.error || (mediaKind === "image" && path?.startsWith("/media/profiles/") && failedMediaRequests.has(requestKey)
+            ? "Media could not be loaded."
+            : null),
         loading: Boolean(path) && !currentResult
     };
 }
