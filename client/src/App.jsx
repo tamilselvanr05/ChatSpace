@@ -3088,7 +3088,7 @@ if (
                             {profileUser.profilePhoto ? (
                                 <ProtectedImage style={{ width: "100%", height: "100%", objectFit: "cover" }} path={`/media/profiles/${profileUser._id}`} refreshKey={profileUser.profilePhoto} alt="" fallback="👤" onClick={(event) => { event.stopPropagation(); openProfilePhotoViewer(profileUser); }} />
                             ) : (
-                                <>👤</>
+                                <span className="cs-profile-photo-fallback" style={{ width: "48px", height: "48px", fontSize: "21px" }} aria-hidden="true">👤</span>
                             )}
                             </div>
                             <span style={{ flex: 1, minWidth: 0 }}>
