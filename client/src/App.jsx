@@ -7,6 +7,7 @@ import { auth } from "./firebase";
 import { apiUrl } from "./config";
 import { getCallHistoryPeerId } from "./utils/callHistoryConversation";
 import { getProfileUser } from "./utils/profileResponse";
+import { updateProfilePhotoViewer } from "./utils/profilePhotoViewer";
 import socket from "./socket";
 import CallOverlay from "./components/CallOverlay";
 import CallHistoryEntry from "./components/CallHistoryEntry";
@@ -1032,9 +1033,7 @@ useEffect(() => {
             } : group;
             setGroups((previousGroups) => previousGroups.map(updateGroup));
             setSelectedGroup(updateGroup);
-            setPhotoViewerProfile((previous) => previous?.userId?.toString() === changedUserId?.toString()
-                ? { ...previous, profilePhoto }
-                : previous);
+            setPhotoViewerProfile((previous) => updateProfilePhotoViewer(previous, changedUserId, profilePhoto));
         };
         socket.on("profilePhotoUpdated", handleProfilePhotoUpdated);
 
